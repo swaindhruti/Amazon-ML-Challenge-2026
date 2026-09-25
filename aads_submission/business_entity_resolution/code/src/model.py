@@ -9,6 +9,13 @@ from src.features import FEATURE_COLS
 class EntityMatchingModel:
     def __init__(self, use_transformer=False):
         self.model = xgb.XGBClassifier(
+            # Many shallow trees (max_depth=6) rather than few deep ones, plus
+            # min_child_weight/gamma/reg_alpha/reg_lambda all pulling toward
+            # simpler splits and subsample/colsample_bytree<1: the positive
+            # (true-match) pair count is comparatively small next to how many
+            # candidate pairs exist, so these all guard against overfitting
+            # to that limited positive signal rather than tuned for raw
+            # accuracy on a large balanced dataset.
             n_estimators=500,
             learning_rate=0.05,
             max_depth=6,
@@ -21,7 +28,7 @@ class EntityMatchingModel:
             random_state=42,
             # Bias toward precision: penalize false positives more
             scale_pos_weight=0.7,
-            tree_method='hist',
+            tree_method='hist',  # histogram-binned splits -- needed for speed at 10M+ row scale
             eval_metric='logloss',
             early_stopping_rounds=30,
         )

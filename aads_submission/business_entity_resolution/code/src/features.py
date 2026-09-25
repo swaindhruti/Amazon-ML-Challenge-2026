@@ -3,6 +3,12 @@ import numpy as np
 from rapidfuzz import fuzz, distance
 from typing import Sequence
 
+# Hand-engineered string/structural similarity features rather than learned
+# embeddings: the competition prohibits external data/API lookups, and
+# RapidFuzz's C implementation is fast enough (500k+ pairs/sec) to run over
+# every candidate pair within the RAM/time budget without needing a GPU or a
+# separate embedding index.
+
 
 def compute_jaccard(s1: str, s2: str) -> float:
     if not s1 or not s2:
@@ -101,6 +107,10 @@ def build_batch_features(
         return pd.DataFrame()
 
     # --- Resolve column names ---
+    # Prefers the most-normalized column available but falls back gracefully
+    # (_norm -> _clean -> raw) since this function is called from several
+    # places with dataframes prepared to different degrees -- training builds
+    # a fully-processed frame, but a caller could pass raw source data.
     q_name_col = next(
         (c for c in ['business_name_norm', 'business_name_clean', 'business_name'] if c in df_query.columns),
         'business_name'
@@ -231,6 +241,10 @@ def build_feature_dataset(
     q_indices = []
     t_indices = []
 
+    # iterrows() here is fine: this path parses a candidate_pairs.tsv-style
+    # DataFrame (comma-joined ID strings needing per-row splitting), not the
+    # hot per-pair scoring loop -- that one is build_batch_features() above,
+    # which stays vectorized/array-indexed for the 10M+ pair scale.
     for _, row in df_candidates.iterrows():
         s1_id = row['source1_entity_id']
         cands = row['candidate_entity_ids'].split(',') if row['candidate_entity_ids'] else []
