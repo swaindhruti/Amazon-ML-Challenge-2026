@@ -17,15 +17,23 @@ from collections import defaultdict
 
 from src.preprocessing import (
     load_data, clean_text, normalize_abbreviations,
-    extract_numerical_tokens, strip_legal_suffixes,
+    extract_numerical_tokens, strip_legal_suffixes, strip_landmark_words,
 )
 from src.candidate_generation import CompactInvertedIndex
 from src.features import build_batch_features, FEATURE_COLS
 from src.model import EntityMatchingModel
-from src.evaluate import optimize_threshold, evaluate_macro_f05, evaluate_detailed
+from src.evaluate import (
+    optimize_threshold, evaluate_macro_f05, evaluate_detailed,
+    evaluate_candidate_quality, evaluate_detailed_by_country,
+)
+from src.splits import (
+    stratified_country_split, y_true_dict_from_split, s1_id_to_country_map, stratified_sample,
+)
+from src.memlog import log_memory
 
 
 def build_y_true_dict(df_gt: pd.DataFrame) -> dict:
+    """Converts train_ground_truth.tsv into {s1_id: set(matched_ids)} for scoring."""
     y_true = {}
     for _, row in df_gt.iterrows():
         s1_id = row['source1_entity_id']
@@ -45,7 +53,7 @@ def prepare_text_arrays(df: pd.DataFrame):
     names_norm = [normalize_abbreviations(t) for t in names_clean]
     names_stripped = [strip_legal_suffixes(t) for t in names_clean]
     addrs_clean = [clean_text(t) for t in df['business_address'].values]
-    addrs_norm = [normalize_abbreviations(t) for t in addrs_clean]
+    addrs_norm = [strip_landmark_words(normalize_abbreviations(t)) for t in addrs_clean]
     nums = [extract_numerical_tokens(t) for t in addrs_clean]
     return names_clean, names_norm, names_stripped, addrs_clean, addrs_norm, nums
 
@@ -81,13 +89,17 @@ def train_or_load_model(args, df_s1: pd.DataFrame, df_s2_s3: pd.DataFrame, model
         neg_q_idx = []
         neg_t_idx = []
 
-        # Use more training data and harder negatives
+        # Use more training data and harder negatives. Sampled proportionally
+        # by country rather than df_s1.iloc[:n_sample] -- the first N rows of
+        # the raw file give no guarantee of country balance, and a skewed
+        # sample here would silently bias calibration toward one country.
         n_sample = min(50000, len(df_s1))
+        s1_sample = stratified_sample(df_s1, n_sample, key='country_clean', seed=42)
         neg_ratio = 5  # 5 negatives per positive for precision emphasis
 
         rng = np.random.RandomState(42)
-        for i in range(n_sample):
-            s1_id = df_s1['entity_id'].iloc[i]
+        for i in range(len(s1_sample)):
+            s1_id = s1_sample['entity_id'].iloc[i]
             if s1_id in gt_dict:
                 matches = gt_dict[s1_id]
                 for m in matches:
@@ -114,7 +126,7 @@ def train_or_load_model(args, df_s1: pd.DataFrame, df_s2_s3: pd.DataFrame, model
             val_t = np.array(pos_t_idx[split_pos:] + neg_t_idx[split_neg:], dtype=np.uint32)
             val_labels = np.array([1]*(n_pos-split_pos) + [0]*(n_neg-split_neg), dtype=np.int32)
 
-            s1_sub = df_s1.iloc[:n_sample].reset_index(drop=True)
+            s1_sub = s1_sample.reset_index(drop=True)
             s1_clean, s1_norm, s1_stripped, s1_addrs_clean, s1_addrs_norm, s1_nums = prepare_text_arrays(s1_sub)
             s1_proc = pd.DataFrame({
                 'entity_id': s1_sub['entity_id'].values,
@@ -175,6 +187,14 @@ def assemble_matches_per_source(
     """
     Given matched_map = {s1_id: [(candidate_id, score), ...]},
     return {s1_id: [best S2 matches, best S3 matches]} with per-source capping.
+
+    The caps (default 5 S2 / 6 S3) come from ground-truth cardinality
+    analysis, not a guess: real S1 entities can genuinely have several true
+    branches/filings per source, so capping at 1 would hurt recall, but an
+    uncapped list would let a few borderline high-scoring false positives
+    tank precision -- and F0.5 punishes a false positive twice as hard as a
+    missed match. Capped independently per source since S2/S3 have their own
+    cardinality distributions.
     """
     result = {}
     for s1_id, scored_pairs in matched_map.items():
@@ -203,6 +223,10 @@ def main(args):
         s1_path = os.path.join(args.data_dir, 'test', 'test_source1.tsv')
         s2_test = os.path.join(args.data_dir, 'test', 'test_source2.tsv')
         s3_test = os.path.join(args.data_dir, 'test', 'test_source3.tsv')
+        # Falls back to the train-split S2/S3 files only if the test-split
+        # ones aren't present locally -- lets --subset smoke tests run before
+        # the full test dataset has been downloaded, without silently mixing
+        # train and test target pools when both are actually available.
         s2_path = s2_test if os.path.exists(s2_test) else os.path.join(args.data_dir, 'train', 'train_source2.tsv')
         s3_path = s3_test if os.path.exists(s3_test) else os.path.join(args.data_dir, 'train', 'train_source3.tsv')
 
@@ -218,9 +242,15 @@ def main(args):
         df_s1 = df_s1.head(args.subset)
         print(f"Using subset of {args.subset} S1 records for execution.")
 
-    # Clean country strings for robust partitioning
-    df_s1['country_clean'] = [clean_text(c) for c in df_s1['country'].values]
-    df_s2_s3['country_clean'] = [clean_text(c) for c in df_s2_s3['country'].values]
+    # Clean country strings for robust partitioning. Categorical, not plain
+    # str/object: measured on a 100k-row proxy (few distinct countries, real
+    # dataset scale extrapolated), this column alone drops from ~757MB to
+    # ~13MB at the real ~12.5M-row scale -- a big win for close to zero risk,
+    # since every place this is used (==, .unique(), .values) already works
+    # identically on a categorical Series.
+    df_s1['country_clean'] = pd.Categorical([clean_text(c) for c in df_s1['country'].values])
+    df_s2_s3['country_clean'] = pd.Categorical([clean_text(c) for c in df_s2_s3['country'].values])
+    log_memory("after loading + country partitioning")
 
     # 2. Model setup / training
     model, best_th = train_or_load_model(args, df_s1, df_s2_s3, args.model_path)
@@ -231,58 +261,93 @@ def main(args):
     print(f"Per-source caps: max_s2={args.max_s2}, max_s3={args.max_s3}")
 
     # ─── VALIDATION MODE ─────────────────────────────────────────────────────
+    # Threshold is tuned on the VAL fold only; the reported score comes from
+    # the TEST fold, which the tuning step never sees. Reporting F0.5 on the
+    # same data the threshold was chosen against is an optimistic estimate,
+    # not a generalizing one -- this is what previously produced numbers that
+    # swung from ~0.88 (full/large runs) to ~0.99 (small, singleton-heavy
+    # --subset runs) depending on what happened to be measured.
     if args.validate and args.is_train:
-        print("\n═══ VALIDATION MODE: Tuning threshold on ground truth ═══")
+        print("\n═══ VALIDATION MODE: held-out val/test split, stratified by country ═══")
         gt_path = os.path.join(args.data_dir, 'train', 'train_ground_truth.tsv')
         if os.path.exists(gt_path):
             df_gt = load_data(gt_path)
-            gt_dict = build_y_true_dict(df_gt)
+
+            df_train_s1, df_val_s1, df_test_s1 = stratified_country_split(
+                df_s1, df_gt, val_frac=0.15, test_frac=0.15, seed=42
+            )
             del df_gt
             gc.collect()
+            print(f"Split (stratified by country): train={len(df_train_s1)} | "
+                  f"val={len(df_val_s1)} | test={len(df_test_s1)}")
 
-            # Filter to subset if applicable
-            val_s1_ids = set(df_s1['entity_id'].values)
-            gt_dict_sub = {k: v for k, v in gt_dict.items() if k in val_s1_ids}
-            print(f"Validation set: {len(gt_dict_sub)} S1 entities")
+            val_ids = set(df_val_s1['entity_id'].values)
+            test_ids = set(df_test_s1['entity_id'].values)
+            y_true_val = y_true_dict_from_split(df_val_s1)
+            y_true_test = y_true_dict_from_split(df_test_s1)
+            id_to_country = {**s1_id_to_country_map(df_val_s1), **s1_id_to_country_map(df_test_s1)}
 
-            # Collect all scored pairs for threshold sweep
+            # Score val+test together once (never train fold -- that would leak
+            # into threshold tuning and inflate the number).
+            eval_s1 = pd.concat([df_val_s1, df_test_s1], ignore_index=True)
             all_scored_pairs = _run_scoring_pipeline(
-                df_s1, df_s2_s3, model, args, collect_scores=True
+                eval_s1, df_s2_s3, model, args, collect_scores=True
             )
+            del df_train_s1, eval_s1
+            gc.collect()
 
             if all_scored_pairs is not None and not all_scored_pairs.empty:
+                val_scores = all_scored_pairs[all_scored_pairs['source1_entity_id'].isin(val_ids)]
+                test_scores = all_scored_pairs[all_scored_pairs['source1_entity_id'].isin(test_ids)]
+
+                # Blocking quality: measured on every candidate that reached scoring,
+                # regardless of score -- the hard ceiling before any threshold applies.
+                cand_quality = evaluate_candidate_quality(
+                    all_scored_pairs[['source1_entity_id', 'candidate_entity_id']],
+                    {**y_true_val, **y_true_test}
+                )
+                print("\nCandidate/blocking quality (val+test combined):")
+                for k, v in cand_quality.items():
+                    print(f"  {k}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
+
+                print("\nThreshold sweep (val fold only):")
                 thresholds = np.arange(0.50, 0.96, 0.02).tolist()
-                print("\nThreshold sweep:")
-                best_th, best_f05 = optimize_threshold(
-                    all_scored_pairs, gt_dict_sub, thresholds,
+                best_th, _ = optimize_threshold(
+                    val_scores, y_true_val, thresholds,
                     max_s2=args.max_s2, max_s3=args.max_s3
                 )
-
-                # Fine-tune around best
                 fine_ths = np.arange(max(0.50, best_th - 0.05), min(0.96, best_th + 0.06), 0.01).tolist()
-                print("\nFine-tuning:")
-                best_th, best_f05 = optimize_threshold(
-                    all_scored_pairs, gt_dict_sub, fine_ths,
+                print("\nFine-tuning (val fold only):")
+                best_th, best_f05_val = optimize_threshold(
+                    val_scores, y_true_val, fine_ths,
                     max_s2=args.max_s2, max_s3=args.max_s3
                 )
+                print(f"\n★ Threshold chosen on val fold: {best_th:.2f} (val Macro F0.5 = {best_f05_val:.4f})")
 
-                print(f"\n★ Optimal threshold: {best_th:.2f} → Macro F0.5 = {best_f05:.4f}")
-
-                # Show detailed stats at best threshold
+                # Final, generalizing number: apply that threshold to the TEST
+                # fold, which never influenced the threshold choice above.
                 from src.evaluate import _apply_threshold_with_capping
-                y_pred_best = _apply_threshold_with_capping(
-                    all_scored_pairs, gt_dict_sub, best_th,
-                    args.max_s2, args.max_s3
+                y_pred_test = _apply_threshold_with_capping(
+                    test_scores, y_true_test, best_th, args.max_s2, args.max_s3
                 )
-                details = evaluate_detailed(gt_dict_sub, y_pred_best)
-                print(f"\nDetailed evaluation at threshold={best_th:.2f}:")
-                for k, v in details.items():
-                    if isinstance(v, float):
-                        print(f"  {k}: {v:.4f}")
-                    else:
-                        print(f"  {k}: {v}")
+                test_f05 = evaluate_macro_f05(y_true_test, y_pred_test)
+                print(f"\n★★★ HELD-OUT TEST FOLD Macro F0.5 = {test_f05:.4f} "
+                      f"(threshold never tuned against this fold) ★★★")
 
-            del gt_dict, gt_dict_sub, all_scored_pairs
+                details = evaluate_detailed(y_true_test, y_pred_test)
+                print(f"\nDetailed test-fold evaluation at threshold={best_th:.2f}:")
+                for k, v in details.items():
+                    print(f"  {k}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
+
+                by_country = evaluate_detailed_by_country(y_true_test, y_pred_test, id_to_country)
+                print("\nPer-country breakdown (test fold):")
+                for country, cdetails in by_country.items():
+                    print(f"  [{country}] macro_f05={cdetails['macro_f05']:.4f} "
+                          f"precision={cdetails['mean_precision']:.4f} "
+                          f"recall={cdetails['mean_recall']:.4f} "
+                          f"n={cdetails['total_entities']}")
+
+            del df_val_s1, df_test_s1, all_scored_pairs
             gc.collect()
 
     # ─── INFERENCE: Write output files ────────────────────────────────────────
@@ -359,7 +424,18 @@ def main(args):
         index.build(t_clean, t_addrs_clean, t_nums)
         print(f"Built inverted index for '{country}' in {time.time() - idx_t0:.2f} s | Keys: {len(index.index)}")
 
-        # Preprocess S1 text arrays
+        # t_clean/t_norm/t_stripped/t_addrs_clean/t_addrs_norm/t_nums are all
+        # consumed now (into either the index or df_target_proc) -- for the
+        # largest country (e.g. US, the majority of S2+S3), holding all six
+        # loose lists alive for the rest of this country's processing would
+        # duplicate df_target_proc's own copy of four of them for no reason.
+        del t_clean, t_norm, t_stripped, t_addrs_clean, t_addrs_norm, t_nums
+        log_memory(f"after building index for '{country}'")
+
+        # Preprocess S1 text arrays. q_clean/q_addrs_clean/q_nums are kept --
+        # the batch loop below still slices them per-batch -- but q_norm/
+        # q_stripped/q_addrs_norm are only needed to build df_s1_proc, so
+        # they're freed the same way right after.
         q_clean, q_norm, q_stripped, q_addrs_clean, q_addrs_norm, q_nums = prepare_text_arrays(s1_country)
         df_s1_proc = pd.DataFrame({
             'entity_id': s1_country['entity_id'].values,
@@ -368,6 +444,8 @@ def main(args):
             'business_address_norm': q_addrs_norm,
             'address_numbers': q_nums,
         })
+        del q_norm, q_stripped, q_addrs_norm
+        gc.collect()
 
         num_batches = int(np.ceil(len(s1_country) / args.batch_size))
         print(f"Processing S1 in {num_batches} batches (batch_size={args.batch_size})...")
@@ -458,6 +536,8 @@ def main(args):
             # Immediate batch garbage collection
             del q_idx, t_idx, scored_map, capped_matches, matching_rows, df_match_batch, sub_s1_df
             gc.collect()
+            if (b + 1) % 5 == 0 or b == num_batches - 1:
+                log_memory(f"'{country}' batch {b+1}/{num_batches}")
 
         # Free country memory
         del index, df_target_proc, df_s1_proc, s1_country, s2_s3_country
@@ -505,6 +585,7 @@ def _run_scoring_pipeline(
 
         index = CompactInvertedIndex(max_block_size=10000, max_candidates=args.top_k)
         index.build(t_clean, t_addrs_clean, t_nums)
+        del t_clean, t_norm, t_stripped, t_addrs_clean, t_addrs_norm, t_nums
 
         q_clean, q_norm, q_stripped, q_addrs_clean, q_addrs_norm, q_nums = prepare_text_arrays(s1_country)
         df_s1_proc = pd.DataFrame({
@@ -514,6 +595,8 @@ def _run_scoring_pipeline(
             'business_address_norm': q_addrs_norm,
             'address_numbers': q_nums,
         })
+        del q_norm, q_stripped, q_addrs_norm
+        gc.collect()
 
         num_batches = int(np.ceil(len(s1_country) / args.batch_size))
         for b in range(num_batches):
@@ -558,7 +641,12 @@ if __name__ == "__main__":
     parser.add_argument('--model_path', type=str, default='models/entity_model.json', help='Model checkpoint path')
     parser.add_argument('--batch_size', type=int, default=50000, help='Batch size for S1 chunking')
     parser.add_argument('--top_k', type=int, default=30, help='Max candidates per query record')
-    parser.add_argument('--threshold', type=float, default=0.80, help='Score decision threshold (default 0.80 for F0.5 precision)')
+    parser.add_argument('--threshold', type=float, default=0.62,
+                         help='Score decision threshold. 0.62 is a placeholder, not a verified '
+                              'optimum -- run --is_train --validate to get the real value for your '
+                              'current data/model via the held-out test-fold harness in src/splits.py, '
+                              'then pass that value here for inference. Kept in sync with '
+                              'optimize_submission.py; previously these two scripts disagreed (0.80 vs 0.62).')
     parser.add_argument('--max_s2', type=int, default=5, help='Max S2 matches per S1 entity')
     parser.add_argument('--max_s3', type=int, default=6, help='Max S3 matches per S1 entity')
     parser.add_argument('--subset', type=int, default=0, help='Subset size for fast baseline execution (0 for full)')
