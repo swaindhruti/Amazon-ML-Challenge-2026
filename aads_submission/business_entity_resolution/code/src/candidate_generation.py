@@ -4,6 +4,14 @@ from collections import defaultdict, Counter
 from typing import List, Tuple, Sequence, Dict, Set
 import gc
 
+from src.preprocessing import ADDRESS_LANDMARK_WORDS
+
+# Words too common to be useful as a blocking key on their own -- e.g. keying
+# on "private" or "limited" alone would pull in a large fraction of the whole
+# India target pool as "candidates" for every query, defeating the point of
+# blocking. Deliberately conservative (hand-curated, not learned): filtering
+# too aggressively would blind blocking to real distinguishing tokens, so
+# this only removes words that are near-universal across unrelated businesses.
 GENERIC_STOP_WORDS: Set[str] = {
     'inc', 'llc', 'ltd', 'corp', 'company', 'corporation', 'limited',
     'pvt', 'private', 'the', 'and', 'street', 'road', 'avenue', 'drive',
@@ -14,10 +22,45 @@ GENERIC_STOP_WORDS: Set[str] = {
 }
 
 def get_first_token(text: str) -> str:
+    """Kept for backward compatibility -- re-exported via blocking.py's public API."""
     if not text:
         return ""
     tokens = text.split()
     return tokens[0] if tokens else ""
+
+_SOUNDEX_CODES = {
+    'B': '1', 'F': '1', 'P': '1', 'V': '1',
+    'C': '2', 'G': '2', 'J': '2', 'K': '2', 'Q': '2', 'S': '2', 'X': '2', 'Z': '2',
+    'D': '3', 'T': '3',
+    'L': '4',
+    'M': '5', 'N': '5',
+    'R': '6',
+}
+
+def soundex(word: str) -> str:
+    """
+    Classic Soundex phonetic code. Used as a blocking key so words that reach
+    a similar pronunciation via different spelling paths -- e.g. "private"
+    vs. "praaivett" (the latter being what a Devanagari-script "प्राइवेट"
+    turns into after transliterate_to_ascii) -- still land in the same
+    candidate block, even though their literal prefixes differ ("pri" vs
+    "pra"), which the existing p3/p4 prefix keys alone would miss.
+    """
+    word = ''.join(ch for ch in word.upper() if ch.isalpha())
+    if not word:
+        return "0000"
+    first_letter = word[0]
+    encoded = [_SOUNDEX_CODES.get(first_letter, '')]
+    prev_code = encoded[0]
+    for ch in word[1:]:
+        if ch in 'HW':
+            continue
+        code = _SOUNDEX_CODES.get(ch, '')
+        if code and code != prev_code:
+            encoded.append(code)
+        prev_code = code
+    result = (first_letter + ''.join(encoded[1:]))[:4]
+    return result + '0' * (4 - len(result))
 
 class CompactInvertedIndex:
     """
@@ -36,61 +79,109 @@ class CompactInvertedIndex:
 
     @staticmethod
     def extract_keys(name: str, addr: str, nums: str) -> List[str]:
+        """
+        Builds the set of inverted-index keys for one record. A candidate pair
+        is proposed whenever a query and a target record share ANY key, so
+        this list is a deliberate blend of tight and loose keys: tight keys
+        (exact, prefix) buy precision/small candidate sets for clean records,
+        looser keys (soundex, single significant word) buy recall for noisy
+        ones -- typos, transliteration, word-order swaps, missing suffixes.
+        """
         keys = []
         if name:
             name_len = len(name)
+            # Prefix keys: catches near-matches with a typo/suffix later in the
+            # name (e.g. "acme corp" vs "acme corporation" share 'p4:acme').
             if name_len >= 4:
                 keys.append('p4:' + name[:4])
             if name_len >= 3:
                 keys.append('p3:' + name[:3])
+            # Exact short-name key: only for names <=25 chars, since a long
+            # exact string is unlikely to repeat verbatim and isn't worth the
+            # index entry -- this key exists for terse names prefix keys alone
+            # would leave under-blocked (e.g. a 3-4 char business name).
             if 3 <= name_len <= 25:
                 keys.append('exact:' + name)
-                
+
+            # Significant-word keys: first/second/last non-stopword tokens,
+            # tolerant of word reordering (a full name match isn't required).
             words = [w for w in name.split() if w not in GENERIC_STOP_WORDS and len(w) >= 3]
             if words:
                 keys.append('w1:' + words[0])
+                # Soundex sibling of w1/w2: catches the same word spelled
+                # differently -- notably the output of transliterate_to_ascii()
+                # on a non-Latin script, which won't share a literal prefix
+                # with its Latin-script counterpart (see README architecture
+                # diagram for a worked example: "private" vs "praaivett").
+                keys.append('sdx1:' + soundex(words[0]))
                 if len(words) > 1:
                     keys.append('w2:' + words[1])
+                    keys.append('sdx2:' + soundex(words[1]))
                 if len(words) > 2:
                     keys.append('wlast:' + words[-1])
-                    
+
         num_list = nums.split() if nums else []
-        addr_words = [w for w in addr.split() if w not in GENERIC_STOP_WORDS and len(w) >= 4] if addr else []
-        
+        addr_words = [
+            w for w in addr.split()
+            if w not in GENERIC_STOP_WORDS and w not in ADDRESS_LANDMARK_WORDS and len(w) >= 4
+        ] if addr else []
+
         if num_list:
+            # Numeric tokens (building/PIN/zip numbers) are high-precision on
+            # their own -- two unrelated businesses rarely share a 4+ digit
+            # number, so this key alone often pins down the right country
+            # block even when the name has heavy noise.
             for num in num_list:
                 if len(num) >= 4:
                     keys.append('num:' + num)
+            # Composite keys: number + a same-record token, so two records
+            # that share ONLY a number (common, e.g. shared building/PIN in a
+            # dense area) or ONLY a name-prefix don't collide as often as they
+            # would on either signal alone.
             if addr_words:
                 keys.append('num_w:' + num_list[0] + '_' + addr_words[0])
             if name and len(name) >= 3:
                 keys.append('num_p3:' + num_list[0] + '_' + name[:3])
-                
+
         if addr_words:
+            # Locality/street-name tokens, landmark filler words already
+            # excluded (see ADDRESS_LANDMARK_WORDS) so this doesn't key on
+            # "near"/"opposite" instead of the actual place name.
             keys.append('aw1:' + addr_words[0])
             if len(addr_words) > 1:
                 keys.append('aw2:' + addr_words[1])
-                
+
         return keys
 
     def build(self, names: Sequence[str], addrs: Sequence[str], nums: Sequence[str]):
         """
         Builds the inverted index from target pool arrays.
+
+        A key's final size can't be known until every record has been
+        indexed, so this necessarily accumulates the full posting list for
+        every key first (as plain Python lists -- a real but transient
+        memory cost for very common keys) before pruning and compacting to
+        np.uint32. There's no way to decide "this key is too common, skip
+        it" any earlier without a separate frequency-counting pass.
         """
         self.num_records = len(names)
         raw_index = defaultdict(list)
-        
+
         for i in range(self.num_records):
             keys = self.extract_keys(names[i], addrs[i], nums[i])
             for k in keys:
                 raw_index[k].append(i)
-                
-        # Compaction: drop blocks > max_block_size, convert retained to np.uint32
+
+        # Compaction: drop blocks > max_block_size (prevents any single key,
+        # e.g. a generic name prefix, from turning every query into an
+        # O(target pool size) comparison), convert retained posting lists to
+        # np.uint32 (a plain Python int list is ~4-8x the memory for the same
+        # data on 10M+ row target pools).
         self.index = {}
         for k, v in raw_index.items():
             if len(v) <= self.max_block_size:
                 self.index[k] = np.array(v, dtype=np.uint32)
-                
+
         del raw_index
         gc.collect()
 
@@ -109,26 +200,31 @@ class CompactInvertedIndex:
         """
         if max_candidates is None:
             max_candidates = self.max_candidates
-            
+
         all_query_idx = []
         all_target_idx = []
-        
+
         index_map = self.index
         n_queries = len(query_names)
-        
+
         for q_i in range(n_queries):
             keys = self.extract_keys(query_names[q_i], query_addrs[q_i], query_nums[q_i])
             if not keys:
                 continue
-                
+
+            # Counter, not a plain set union: a target record matching on
+            # MORE of the query's keys is a stronger candidate than one
+            # matching on just one, so key-overlap count doubles as a cheap
+            # relevance ranking used below to pick which candidates survive
+            # the max_candidates cap.
             cand_counts = Counter()
             for k in keys:
                 if k in index_map:
                     cand_counts.update(index_map[k])
-                    
+
             if not cand_counts:
                 continue
-                
+
             if len(cand_counts) > max_candidates:
                 top_cands = [c for c, _ in cand_counts.most_common(max_candidates)]
             else:
