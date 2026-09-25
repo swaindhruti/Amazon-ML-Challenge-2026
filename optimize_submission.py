@@ -55,7 +55,7 @@ for p in [CODE_DIR, SCRIPT_DIR, os.path.join(SCRIPT_DIR, 'src'), os.path.join(CO
 try:
     from src.preprocessing import (
         load_data, clean_text, normalize_abbreviations,
-        extract_numerical_tokens, strip_legal_suffixes,
+        extract_numerical_tokens, strip_legal_suffixes, strip_landmark_words,
     )
     from src.features import build_batch_features
     from src.model import EntityMatchingModel
@@ -63,10 +63,11 @@ try:
         evaluate_detailed, optimize_threshold, _apply_threshold_with_capping,
     )
     from src.candidate_generation import generate_candidates
+    from src.splits import stratified_sample
 except ImportError:
     from aads_submission.business_entity_resolution.code.src.preprocessing import (
         load_data, clean_text, normalize_abbreviations,
-        extract_numerical_tokens, strip_legal_suffixes,
+        extract_numerical_tokens, strip_legal_suffixes, strip_landmark_words,
     )
     from aads_submission.business_entity_resolution.code.src.features import build_batch_features
     from aads_submission.business_entity_resolution.code.src.model import EntityMatchingModel
@@ -76,6 +77,7 @@ except ImportError:
     from aads_submission.business_entity_resolution.code.src.candidate_generation import (
         generate_candidates,
     )
+    from aads_submission.business_entity_resolution.code.src.splits import stratified_sample
 
 
 def prepare_text_arrays(df: pd.DataFrame):
@@ -84,7 +86,7 @@ def prepare_text_arrays(df: pd.DataFrame):
     names_norm = [normalize_abbreviations(t) for t in names_clean]
     names_stripped = [strip_legal_suffixes(t) for t in names_clean]
     addrs_clean = [clean_text(t) for t in df['business_address'].values]
-    addrs_norm = [normalize_abbreviations(t) for t in addrs_clean]
+    addrs_norm = [strip_landmark_words(normalize_abbreviations(t)) for t in addrs_clean]
     nums = [extract_numerical_tokens(t) for t in addrs_clean]
     return names_clean, names_norm, names_stripped, addrs_clean, addrs_norm, nums
 
@@ -355,7 +357,10 @@ def main():
     parser.add_argument('--train', action='store_true',
                         help='Train a new model before scoring')
     parser.add_argument('--threshold', type=float, default=0.62,
-                        help='Score decision threshold (default: 0.62, calibrated for max F0.5)')
+                        help='Score decision threshold. 0.62 is a placeholder, not a verified '
+                             'optimum -- run pipeline.py --is_train --validate to get the real '
+                             'value via the held-out test-fold harness in src/splits.py, then pass '
+                             'that value here. Kept in sync with pipeline.py\'s default.')
     parser.add_argument('--max_s2', type=int, default=5,
                         help='Max S2 matches per S1 entity (default: 5)')
     parser.add_argument('--max_s3', type=int, default=6,
@@ -431,10 +436,13 @@ def main():
             pos_q, pos_t, neg_q, neg_t = [], [], [], []
             rng = np.random.RandomState(42)
             n_sample = min(50000, len(df_s1))
+            # Sampled proportionally by country rather than df_s1.iloc[:n_sample] --
+            # the first N rows give no guarantee of country balance.
+            s1_sample = stratified_sample(df_s1, n_sample, key='country_clean', seed=42)
 
-            for i in range(n_sample):
-                s1_id = df_s1['entity_id'].iloc[i]
-                s1_c = df_s1['country_clean'].iloc[i]
+            for i in range(len(s1_sample)):
+                s1_id = s1_sample['entity_id'].iloc[i]
+                s1_c = s1_sample['country_clean'].iloc[i]
                 avail_t = country_to_t_idx.get(s1_c, np.array([], dtype=np.uint32))
 
                 if s1_id in gt_dict:
@@ -442,6 +450,15 @@ def main():
                         if m in s23_map:
                             pos_q.append(i)
                             pos_t.append(s23_map[m])
+                            # Negatives drawn from the SAME country as the
+                            # positive, not the whole target pool: a random
+                            # cross-country negative is nearly always trivially
+                            # easy (blocking would never even propose it as a
+                            # candidate), so it teaches the model little. A
+                            # same-country negative is closer to what the model
+                            # will actually have to discriminate at inference
+                            # time, once blocking has already narrowed things
+                            # down to same-country candidates.
                             if len(avail_t) > 0:
                                 n_pick = min(5, len(avail_t))
                                 for ti in rng.choice(avail_t, size=n_pick, replace=False):
@@ -453,7 +470,7 @@ def main():
                 t_idx = np.array(pos_t + neg_t, dtype=np.uint32)
                 labels = np.array([1]*len(pos_q) + [0]*len(neg_q), dtype=np.int32)
 
-                s1_sub = df_s1.iloc[:n_sample].reset_index(drop=True)
+                s1_sub = s1_sample.reset_index(drop=True)
                 _, s1_n, s1_st, _, s1_an, s1_nu = prepare_text_arrays(s1_sub)
                 s1_proc = pd.DataFrame({
                     'entity_id': s1_sub['entity_id'].values,
