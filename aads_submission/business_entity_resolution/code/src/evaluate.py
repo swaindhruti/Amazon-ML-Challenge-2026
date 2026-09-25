@@ -108,6 +108,73 @@ def evaluate_detailed(y_true: Dict[str, set], y_pred: Dict[str, set]) -> dict:
     }
 
 
+def evaluate_candidate_quality(df_candidates: pd.DataFrame, y_true: Dict[str, set]) -> dict:
+    """
+    Measures blocking/candidate-generation quality independently of any
+    threshold or model -- exactly what the competition says it reviews
+    separately from the leaderboard score ("recall ceiling, reduction ratio").
+
+    df_candidates must have ['source1_entity_id', 'candidate_entity_id'], one
+    row per (S1, candidate) pair that reached the scoring stage -- i.e. the
+    same set of pairs that ends up in candidate_pairs.tsv. y_true is the
+    {s1_id: set(true matches)} dict for the same entities.
+
+    recall_ceiling: fraction of ground-truth positive pairs that appear
+    ANYWHERE in df_candidates, regardless of score. This is the hard upper
+    bound on recall -- no threshold or model can recover a true match that
+    blocking never proposed as a candidate.
+    """
+    total_s1 = len(y_true)
+    if df_candidates.empty:
+        return {
+            'avg_candidates_per_entity': 0.0,
+            'median_candidates_per_entity': 0.0,
+            'total_candidate_pairs': 0,
+            'recall_ceiling': 1.0 if all(len(v) == 0 for v in y_true.values()) else 0.0,
+            'entities_with_zero_candidates': total_s1,
+        }
+
+    cand_sets = df_candidates.groupby('source1_entity_id')['candidate_entity_id'].apply(set)
+
+    found_true = 0
+    total_true_pairs = 0
+    for s1_id, true_matches in y_true.items():
+        if not true_matches:
+            continue
+        total_true_pairs += len(true_matches)
+        cands = cand_sets.get(s1_id, set())
+        found_true += len(true_matches.intersection(cands))
+
+    counts_per_entity = cand_sets.apply(len)
+    return {
+        'avg_candidates_per_entity': float(counts_per_entity.mean()) if len(counts_per_entity) else 0.0,
+        'median_candidates_per_entity': float(counts_per_entity.median()) if len(counts_per_entity) else 0.0,
+        'total_candidate_pairs': int(len(df_candidates)),
+        'recall_ceiling': (found_true / total_true_pairs) if total_true_pairs > 0 else 1.0,
+        'entities_with_zero_candidates': int(total_s1 - cand_sets.shape[0]),
+    }
+
+
+def evaluate_detailed_by_country(
+    y_true: Dict[str, set],
+    y_pred: Dict[str, set],
+    s1_id_to_country: Dict[str, str],
+) -> Dict[str, dict]:
+    """
+    Runs evaluate_detailed() separately per country so a regression in one
+    country (e.g. France, which has zero training coverage) isn't averaged
+    away by volume from the others.
+    """
+    by_country: Dict[str, dict] = {}
+    countries = {s1_id_to_country.get(k, 'unknown') for k in y_true}
+    for country in sorted(countries):
+        ids = [k for k in y_true if s1_id_to_country.get(k, 'unknown') == country]
+        y_true_c = {k: y_true[k] for k in ids}
+        y_pred_c = {k: y_pred.get(k, set()) for k in ids}
+        by_country[country] = evaluate_detailed(y_true_c, y_pred_c)
+    return by_country
+
+
 def optimize_threshold(
     df_scores: pd.DataFrame,
     y_true: Dict[str, set],
