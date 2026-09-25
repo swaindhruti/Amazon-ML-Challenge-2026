@@ -1,0 +1,13 @@
+# Never bake the dataset, outputs, or model checkpoints into the image --
+# they're mounted at runtime (see README "Docker" section). Keeps the build
+# context small and the image size independent of dataset size.
+student_resource/
+output/
+models/
+
+.venv/
+.git/
+__pycache__/
+*.pyc
+.DS_Store
+*.zip
