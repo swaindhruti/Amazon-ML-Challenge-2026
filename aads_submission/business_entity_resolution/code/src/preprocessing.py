@@ -28,6 +28,12 @@ LEGAL_SUFFIXES_RAW = [
     # Other
     'pty', 'bv', 'nv', 'ab', 'as', 'oy', 'srl', 'spa',
     'pte',
+    # What text_unidecode turns the native-script spellings of "private
+    # limited" / "LLP" into (Devanagari, Gujarati, Telugu, Kannada, Bengali,
+    # Tamil...): without these, a Hindi-script "... प्राइवेट लिमिटेड" keeps
+    # "praaivett limittedd" as if it were part of the business name, which
+    # can never line up with the Latin-script counterpart's stripped name.
+    'praaivett', 'praiveett', 'praaibhett', 'limittedd', 'limittett', 'elelpii',
 ]
 # Sort longest-first so multi-word suffixes match before their fragments
 LEGAL_SUFFIXES_RAW.sort(key=len, reverse=True)
@@ -210,3 +216,44 @@ def preprocess_dataframe(df: pd.DataFrame, inplace: bool = False) -> pd.DataFram
         df['country_clean'] = [clean_text(t) for t in df['country'].values]
 
     return df
+
+
+# Domain-style tokens that appear when a name is really a website
+# ("wilfordhancock.com" -> "wilfordhancock com"). Dropped ONLY when building
+# the space-free "compact" name below, never from the normal name columns.
+DOMAIN_TOKENS = {'www', 'com', 'net', 'org', 'biz', 'info'}
+
+
+def compact_name(stripped_name: str) -> str:
+    """
+    Space-free form of a (legal-suffix-stripped) name, e.g. "wilford hancock
+    associates" -> "wilfordhancockassociates". Some records are written as a
+    single glued domain-style token ("wilfordhancock.com") while their true
+    counterpart is space-separated; every token-based feature scores such a
+    pair near zero, but a character-level comparison of the glued forms still
+    lines up.
+    """
+    if not stripped_name:
+        return ""
+    tokens = [t for t in stripped_name.split() if t not in DOMAIN_TOKENS]
+    return ''.join(tokens) if tokens else stripped_name.replace(' ', '')
+
+
+def prepare_text_chunk(names, addrs):
+    """
+    Cleans one chunk of raw names/addresses into every derived text column the
+    pipeline needs. Module-level (picklable) and free of shared state so
+    src.parallel can run chunks on separate cores; also used serially.
+    Returns 8 parallel lists:
+      names_clean, names_norm, names_stripped, names_compact,
+      addrs_clean, addrs_norm, nums, name_is_native (raw name had non-ASCII).
+    """
+    names_clean = [clean_text(t) for t in names]
+    names_norm = [normalize_abbreviations(t) for t in names_clean]
+    names_stripped = [strip_legal_suffixes(t) for t in names_clean]
+    names_compact = [compact_name(t) for t in names_stripped]
+    addrs_clean = [clean_text(t) for t in addrs]
+    addrs_norm = [strip_landmark_words(normalize_abbreviations(t)) for t in addrs_clean]
+    nums = [extract_numerical_tokens(t) for t in addrs_clean]
+    native = [not (isinstance(t, str) and t.isascii()) for t in names]
+    return names_clean, names_norm, names_stripped, names_compact, addrs_clean, addrs_norm, nums, native
