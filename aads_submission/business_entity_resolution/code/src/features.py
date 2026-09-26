@@ -120,12 +120,13 @@ def _python_feature_chunk(task):
     cover) for one slice of pairs. Module-level and self-contained so
     src.parallel can run slices on separate cores.
     """
-    q_names, t_names, q_stripped, t_stripped, q_addrs, t_addrs, q_nums, t_nums = task
+    q_names, t_names, q_stripped, t_stripped, q_addrs, t_addrs, q_nums, t_nums, q_states, t_states = task
     n = len(q_names)
     out = {k: np.zeros(n, dtype=np.float32) for k in (
         'stripped_exact', 'first_token_match', 'common_token_frac', 'name_length_ratio',
         'name_char_ratio', 'name_token_overlap', 'name_prefix_match', 'addr_jaccard',
-        'addr_ngram_sim', 'addr_missing', 'zip_exact', 'nums_overlap', 'street_num_match')}
+        'addr_ngram_sim', 'addr_missing', 'zip_exact', 'nums_overlap', 'street_num_match',
+        'state_match', 'state_conflict', 'nums_conflict', 'first_num_conflict')}
     for i in range(n):
         n1, n2, s1, s2 = q_names[i], t_names[i], q_stripped[i], t_stripped[i]
         a1, a2, z1, z2 = q_addrs[i], t_addrs[i], q_nums[i], t_nums[i]
@@ -156,6 +157,22 @@ def _python_feature_chunk(task):
         out['nums_overlap'][i] = _nums_overlap_score(z1, z2)
         f1, f2 = (z1.split()[:1] if z1 else []), (z2.split()[:1] if z2 else [])
         out['street_num_match'][i] = 1.0 if (f1 and f1 == f2) else 0.0
+
+        # Location agreement / conflict. State (canonical code, see
+        # preprocessing.clean_address) matching is positive evidence; both
+        # known and DIFFERENT is strong negative evidence -- the same name in
+        # another state is a different business. Likewise numbers: when each
+        # side has a number the other lacks ("15/383" vs "15/404"), it is a
+        # different address, which a plain overlap score can't distinguish
+        # from "one side simply omitted a number".
+        st1, st2 = q_states[i], t_states[i]
+        if st1 and st2:
+            out['state_match'][i] = 1.0 if st1 == st2 else 0.0
+            out['state_conflict'][i] = 0.0 if st1 == st2 else 1.0
+        n1s, n2s = set(z1.split()) if z1 else set(), set(z2.split()) if z2 else set()
+        if n1s and n2s:
+            out['nums_conflict'][i] = 1.0 if (n1s - n2s and n2s - n1s) else 0.0
+            out['first_num_conflict'][i] = 1.0 if z1.split()[0] != z2.split()[0] else 0.0
     return out
 
 
@@ -257,8 +274,11 @@ def compute_feature_arrays(
 
     # -- Pure-Python token/structure features: process pool --
     ranges = split_ranges(len(q_names), min_chunk=25_000)
+    q_states = gather(df_query, 'state', query_indices)
+    t_states = gather(df_target, 'state', target_indices)
     tasks = [(q_names[s:e], t_names[s:e], q_stripped[s:e], t_stripped[s:e],
-              q_addrs[s:e], t_addrs[s:e], q_nums[s:e], t_nums[s:e]) for s, e in ranges]
+              q_addrs[s:e], t_addrs[s:e], q_nums[s:e], t_nums[s:e],
+              q_states[s:e], t_states[s:e]) for s, e in ranges]
     for part in _merge_parts(map_chunks(_python_feature_chunk, tasks)).items():
         feats[part[0]] = part[1]
 
@@ -352,6 +372,7 @@ FEATURE_COLS = [
     'addr_jaccard', 'addr_ngram_sim', 'zip_exact', 'nums_overlap',
     'addr_token_set', 'addr_ratio', 'addr_missing', 'street_num_match',
     'name_compact_ratio', 'name_compact_partial', 'name_prefix_match',
+    'state_match', 'state_conflict', 'nums_conflict', 'first_num_conflict',
 ]
 
 # Only present when the corresponding input was supplied (see
