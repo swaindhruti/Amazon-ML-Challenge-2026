@@ -163,9 +163,17 @@ Verified on synthetic data: the parallel and serial feature paths give identical
 
 A supplement, **not** the main scoring engine (the trained classifier carries the score). Cross-script matching is already attacked lexically by transliteration + Soundex; an embedding model can catch what those miss.
 
-**Model:** [`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`](https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2) — Apache-2.0, ~118M parameters (competition limit is 8B), from the UKP Lab / sentence-transformers project (Reimers & Gurevych, EMNLP 2020); covers 50+ languages including Hindi, Bengali, Gujarati, Tamil, Marathi, Urdu. Used as-is. It replaces `Graphlet-AI/eridu`, which could not be loaded on the team's SageMaker instance (eridu was itself fine-tuned from this model). Retrieval uses [FAISS](https://github.com/facebookresearch/faiss) (`faiss-cpu`, MIT) — exact search for small pools, HNSW for pools over 200k vectors (an exact search of a 50k-query batch against 1M+ vectors is tens of trillions of operations per batch).
+**Models** (`--embedding_model`, license/size/language facts read from each model's Hugging Face page; all far under the competition's 8B-parameter limit, used as-is):
 
-**Offline instances:** if SageMaker can't reach huggingface.co, download once elsewhere and pass a folder: `--embedding_model models/hf/minilm` (see `src/embeddings.py` docstring for the one-liner). A local directory is loaded with no network check.
+| Preset | Model | License | Size / dim | Languages | Notes |
+|---|---|---|---|---|---|
+| `labse` **(default)** | [`sentence-transformers/LaBSE`](https://huggingface.co/sentence-transformers/LaBSE) | Apache-2.0 | ~0.5B / 768 | 109, incl. Hindi, Bengali, Tamil, Telugu, Kannada, Malayalam, Gujarati, Marathi, Punjabi, Oriya | Trained to align translations of the same text across languages (Feng et al., 2020) — the closest fit to "same name, different script". BERT-base compute. |
+| `bge-m3` | [`BAAI/bge-m3`](https://huggingface.co/BAAI/bge-m3) | MIT | 1024-dim | 100+ | Strongest general multilingual model here, but a much larger network → noticeably slower on CPU. Try if LaBSE under-performs. |
+| `minilm` | [`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`](https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2) | Apache-2.0 | ~118M / 384 | 50+ | Fastest; weakest Indic coverage. |
+
+**Which is best for business names on this data has not been measured** — run `--validate` with each and compare the test-fold F0.5 (per-country) before committing to one. Not used: `multilingual-e5-*` (needs `query: ` prefixes on every input; its authors note degraded quality for low-resource languages). `Graphlet-AI/eridu`, used in an earlier iteration, could not be loaded on SageMaker. Retrieval uses [FAISS](https://github.com/facebookresearch/faiss) (`faiss-cpu`, MIT) — exact search for small pools, HNSW above 200k vectors.
+
+**Offline instances:** if SageMaker can't reach huggingface.co, save the model once where you can and pass the folder, e.g. `--embedding_model models/hf/labse` (one-liner in the `src/embeddings.py` docstring). A local directory is loaded with no network check.
 
 **Cost control (`--embed_countries`, default `india`):** encoding is the most expensive step. Only **native-script targets** are encoded (Latin-script targets are already handled lexically), and only for the listed countries. Pairs whose target wasn't encoded get `semantic_sim = NaN` (XGBoost's "missing"), not a fake 0. Encoding time at real scale is **still unmeasured** — try `--subset` first.
 
@@ -338,7 +346,7 @@ Produces `output/matching_results.tsv` + `output/candidate_pairs.tsv`, using the
 The container sees all of the host's CPUs by default, and the pipeline uses them all (`--n_jobs 0`). To cap it: `docker run --cpus 8 ... aads-entity-resolution ... --n_jobs 8` (pass both — `--cpus` limits the container, `--n_jobs` sizes the worker pools; a mismatch just oversubscribes).
 
 ### Embeddings in Docker
-Add `--use_embeddings` to both commands. The model downloads into `/models/hf` (`HF_HOME`), i.e. into your mounted `./models` folder, once. On an instance with no internet, put a pre-downloaded copy at `./models/hf/minilm` and add `--embedding_model /models/hf/minilm`. The image installs the **CPU** PyTorch wheel; it does not use a GPU.
+Add `--use_embeddings` to both commands. The model downloads into `/models/hf` (`HF_HOME`), i.e. into your mounted `./models` folder, once. On an instance with no internet, put a pre-downloaded copy at `./models/hf/labse` and add `--embedding_model /models/hf/labse`. The image installs the **CPU** PyTorch wheel; it does not use a GPU.
 
 ---
 

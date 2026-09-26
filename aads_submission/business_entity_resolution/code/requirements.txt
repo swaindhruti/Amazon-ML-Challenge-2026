@@ -11,8 +11,8 @@ text-unidecode==1.3
 tqdm==4.66.4
 
 # Optional semantic matching (--use_embeddings, see src/embeddings.py).
-# Model: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
-# (Apache-2.0, ~118M params). Use a CPU-only torch wheel unless the instance
+# Model: LaBSE by default (Apache-2.0, 109 languages); BGE-M3 / MiniLM presets available
+# (see src/embeddings.py). Use a CPU-only torch wheel unless the instance
 # actually has a GPU -- a plain `pip install torch` pulls the multi-GB CUDA
 # build. The Dockerfile installs the CPU wheel first, so this pin is then
 # already satisfied; on SageMaker without Docker run:

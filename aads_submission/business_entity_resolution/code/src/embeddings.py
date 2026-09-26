@@ -15,23 +15,41 @@ lexical/address/IDF features (see training.py) carries the score. Embeddings
 are off by default (--use_embeddings) because encoding is the single most
 expensive step in the pipeline (a transformer forward pass per name).
 
-Model credit: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
-(https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2),
-Apache-2.0, ~118M parameters (far under the competition's 8B limit), from the
-UKP Lab / sentence-transformers project (Reimers & Gurevych, "Making
-Monolingual Sentence Embeddings Multilingual using Knowledge Distillation",
-EMNLP 2020). Supports 50+ languages including Hindi, Bengali, Gujarati, Tamil,
-Marathi and Urdu. Used as-is, no fine-tuning.
+Models (presets; pass a preset name, a Hub id, or a local directory via
+--embedding_model). License/size/language facts below were read from each
+model's Hugging Face page; which one is BEST for business names on this data
+has NOT been measured -- compare with --validate on SageMaker.
+
+  labse   (DEFAULT) sentence-transformers/LaBSE -- Apache-2.0, ~0.5B params,
+          768-dim, 109 languages including the Indic ones (Hindi, Bengali,
+          Tamil, Telugu, Kannada, Malayalam, Gujarati, Marathi, Punjabi,
+          Oriya...). Trained to align translations of the same text across
+          languages (Feng et al., "Language-agnostic BERT Sentence
+          Embedding", 2020) -- the closest fit to "same name, different
+          script". BERT-base compute, so speed is comparable to MiniLM
+          despite the large vocabulary.
+  bge-m3  BAAI/bge-m3 -- MIT, 1024-dim, 100+ languages (Chen et al., "BGE
+          M3-Embedding", 2024). Strongest general multilingual model of the
+          three but a much larger network (XLM-R-large class): noticeably
+          slower on CPU. Try it only if LaBSE under-performs and time allows.
+  minilm  sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 --
+          Apache-2.0, ~118M params, 384-dim, 50+ languages. Fastest; weakest
+          Indic coverage of the three.
+
+All are far under the competition's 8B-parameter limit and are used as-is
+(no fine-tuning). Not used: multilingual-e5-* (MIT) needs "query: " prefixes
+on every input and its authors note degraded quality for low-resource
+languages.
 
 History: this module originally targeted Graphlet-AI/eridu; that repository
 could not be loaded on the team's SageMaker instance, so it was replaced with
-the public model above (which eridu itself was fine-tuned from).
+public, verified models (eridu itself was fine-tuned from the MiniLM one).
 
 Offline / locked-down instances: if the instance cannot reach huggingface.co,
 download the model once somewhere that can and point at the folder:
     python -c "from sentence_transformers import SentenceTransformer as S; \\
-               S('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2').save('models/hf/minilm')"
-    python -m src.pipeline ... --use_embeddings --embedding_model models/hf/minilm
+               S('sentence-transformers/LaBSE').save('models/hf/labse')"
+    python -m src.pipeline ... --use_embeddings --embedding_model models/hf/labse
 A local directory is loaded directly with no network check.
 
 Nothing here has been run end-to-end against the real weights in the dev
@@ -42,7 +60,18 @@ import os
 import numpy as np
 from typing import List, Optional, Tuple
 
-EMBEDDING_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+MODEL_PRESETS = {
+    'labse': "sentence-transformers/LaBSE",
+    'bge-m3': "BAAI/bge-m3",
+    'minilm': "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+}
+EMBEDDING_MODEL_NAME = MODEL_PRESETS['labse']
+
+
+def resolve_model_name(name: Optional[str]) -> str:
+    """Preset alias -> Hub id; anything else (Hub id, local dir) passes through."""
+    name = name or os.environ.get('EMBEDDING_MODEL') or EMBEDDING_MODEL_NAME
+    return MODEL_PRESETS.get(name.lower(), name)
 
 _model_cache = {}
 
@@ -72,7 +101,7 @@ def load_embedding_model(model_name: Optional[str] = None, n_threads: Optional[i
     -- so callers degrade to lexical-only instead of crashing the run.
     model_name may be a Hub id or a local directory (see module docstring).
     """
-    model_name = model_name or os.environ.get('EMBEDDING_MODEL') or EMBEDDING_MODEL_NAME
+    model_name = resolve_model_name(model_name)
     if model_name in _model_cache:
         return _model_cache[model_name]
 

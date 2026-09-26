@@ -422,8 +422,8 @@ if __name__ == "__main__":
                         help='Add multilingual sentence-embedding candidates + a semantic_sim feature '
                              '(src/embeddings.py). Off by default: encoding is the most expensive step.')
     parser.add_argument('--embedding_model', type=str, default=None,
-                        help='Hub id or LOCAL directory of the sentence-transformers model '
-                             '(default: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2).')
+                        help="Preset ('labse' [default], 'bge-m3', 'minilm'), a Hub id, or a LOCAL "
+                             "directory of a sentence-transformers model.")
     parser.add_argument('--embed_countries', type=str, default='india',
                         help="Comma-separated cleaned country names to run embeddings for, or 'all'. "
                              "Default 'india': the only country with a large native-script share.")
