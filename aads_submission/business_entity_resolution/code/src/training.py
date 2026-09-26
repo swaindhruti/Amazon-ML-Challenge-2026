@@ -152,6 +152,7 @@ def train_model(args, df_s1: pd.DataFrame, df_s2_s3: pd.DataFrame, gt_dict: dict
     model.save(model_path)
     save_calibration(model_path, {
         'threshold': float(best_th),
+        'score_type': 'raw',  # tuned on raw pair probabilities; --validate re-tunes on the chosen rule
         'val_macro_f05': float(best_f05),
         'max_s2': args.max_s2,
         'max_s3': args.max_s3,

@@ -21,8 +21,9 @@ from src.model import EntityMatchingModel
 from src.evaluate import (
     optimize_threshold, evaluate_macro_f05, evaluate_detailed,
     evaluate_candidate_quality, evaluate_detailed_by_country,
-    _apply_threshold_with_capping, cap_per_source,
+    _apply_threshold_with_capping,
 )
+from src.decision import owner_normalize, cap_and_threshold, P_FLOOR
 from src.splits import (
     stratified_country_split, y_true_dict_from_split, s1_id_to_country_map,
 )
@@ -66,7 +67,10 @@ def load_train_frames(args):
 
 def train_or_load_model(args, df_s1, df_s2_s3, model_path, embed_model, exclude_ids=None):
     """
-    Returns (model, threshold_or_None).
+    Returns (model, calibration_dict). The calibration dict may be empty
+    (heuristic scorer) and otherwise holds 'threshold' plus 'score_type'
+    ('raw' pair probability, or 'owner' = one-owner-normalized, see
+    src/decision.py) and 'owner_alpha'.
 
     - Not training and a checkpoint exists: load it and its saved calibration.
     - Otherwise, if ground truth is available: train (see src/training.py).
@@ -83,13 +87,14 @@ def train_or_load_model(args, df_s1, df_s2_s3, model_path, embed_model, exclude_
         cal = load_calibration(model_path)
         th = cal.get('threshold')
         print(f"Loaded trained model from {model_path}"
-              + (f" (calibrated threshold {th:.3f}, val macro F0.5 {cal.get('val_macro_f05', float('nan')):.4f})"
+              + (f" (calibrated threshold {th:.3f} on '{cal.get('score_type', 'raw')}' scores, "
+                 f"val macro F0.5 {cal.get('val_macro_f05', float('nan')):.4f})"
                  if th is not None else " (no calibration file found)"))
         if cal and bool(cal.get('use_embeddings')) != bool(args.use_embeddings):
             print("  WARNING: this model was trained with use_embeddings="
                   f"{cal.get('use_embeddings')} but this run has --use_embeddings={args.use_embeddings}; "
                   "semantic_sim will be missing/NaN for the model. Retrain or match the flag.")
-        return model, th
+        return model, cal
 
     gt_path = os.path.join(args.data_dir, 'train', 'train_ground_truth.tsv')
     if os.path.exists(gt_path):
@@ -107,14 +112,50 @@ def train_or_load_model(args, df_s1, df_s2_s3, model_path, embed_model, exclude_
         del gt_dict
         gc.collect()
         if trained is not None:
-            return trained, th
+            return trained, load_calibration(model_path)
 
     print("Using high-precision composite heuristic (no trained model available).")
-    return model, None
+    return model, {}
 
 
-def score_pairs(df_s1, df_s2_s3, model, args, embed_model) -> pd.DataFrame:
-    """Scores every blocking-surviving pair for df_s1; returns [s1 id, candidate id, score]."""
+def score_country_pairs(cd, model, args, embed_model, cand_writer=None):
+    """
+    Scores every blocking-surviving pair of one country. Returns compact
+    parallel arrays (q_idx into the country's S1 rows, t_idx into its target
+    pool, p) for pairs with p >= P_FLOOR -- everything the decision layer
+    needs, at 12 bytes/pair instead of feature frames. cand_writer(b_start,
+    sub, q_idx, t_idx), if given, is called with each batch's full candidate
+    set (what candidate_pairs.tsv records).
+    """
+    qs, ts, ps = [], [], []
+    for b_start, b_end, sub, q_idx, t_idx, emb in iter_candidate_batches(cd, args, embed_model):
+        if cand_writer is not None:
+            cand_writer(b_start, sub, q_idx, t_idx)
+        if len(q_idx) == 0:
+            continue
+        feats = batch_features(cd, b_start, b_end, sub, q_idx, t_idx, emb, args.n_jobs)
+        p = model.predict_proba(feats)
+        del feats
+        keep = p >= P_FLOOR
+        qs.append((q_idx[keep] + b_start).astype(np.int32))
+        ts.append(t_idx[keep].astype(np.uint32))
+        ps.append(p[keep].astype(np.float32))
+    if not qs:
+        return np.zeros(0, np.int32), np.zeros(0, np.uint32), np.zeros(0, np.float32)
+    return np.concatenate(qs), np.concatenate(ts), np.concatenate(ps)
+
+
+def _target_is_s2(cd) -> np.ndarray:
+    return pd.Series(cd.t_ids).str.startswith('S2-').values
+
+
+def score_all_pairs(df_s1, df_s2_s3, model, args, embed_model, keep_s1_ids, alpha):
+    """
+    Scores ALL of df_s1 (so every S1 entity that could compete for a target is
+    present -- the one-owner normalization needs the complete competition), but
+    returns pairs only for the S1 entities in keep_s1_ids (the val/test folds).
+    Columns: source1_entity_id, candidate_entity_id, p (raw), q (owner-normalized).
+    """
     frames = []
     countries = sorted(set(df_s1['country_clean'].unique()) & set(df_s2_s3['country_clean'].unique()))
     for country in countries:
@@ -124,30 +165,45 @@ def score_pairs(df_s1, df_s2_s3, model, args, embed_model) -> pd.DataFrame:
             continue
         print(f"\n--- Scoring country: {country} | S1: {len(s1_c)} | S2+S3: {len(s23_c)} ---")
         cd = build_country_data(country, s1_c, s23_c, args, embed_model)
-        for b_start, b_end, sub, q_idx, t_idx, emb in iter_candidate_batches(cd, args, embed_model):
-            if len(q_idx) == 0:
-                continue
-            feats = batch_features(cd, b_start, b_end, sub, q_idx, t_idx, emb, args.n_jobs)
-            feats['score'] = model.predict_proba(feats)
-            frames.append(feats[['source1_entity_id', 'candidate_entity_id', 'score']])
-            del feats
+        q, t, p = score_country_pairs(cd, model, args, embed_model)
+        qn = owner_normalize(t, p, len(s23_c), alpha)
+        in_eval = np.fromiter((i in keep_s1_ids for i in s1_c['entity_id'].values), dtype=bool, count=len(s1_c))
+        sel = in_eval[q]
+        frames.append(pd.DataFrame({
+            'source1_entity_id': s1_c['entity_id'].values[q[sel]],
+            'candidate_entity_id': cd.t_ids[t[sel]],
+            'p': p[sel], 'q': qn[sel],
+        }))
         cd.free()
-        del s1_c, s23_c
+        del s1_c, s23_c, q, t, p, qn
         gc.collect()
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
-def run_validation(args, model, df_s1, df_s2_s3, splits, embed_model, threshold_hint):
+def _tune(scores, y_true, args):
+    """Coarse then fine threshold sweep on one fold; returns (threshold, macro F0.5)."""
+    th, _ = optimize_threshold(scores, y_true, np.arange(0.10, 0.96, 0.05).tolist(),
+                               max_s2=args.max_s2, max_s3=args.max_s3, verbose=False)
+    fine = np.arange(max(0.02, th - 0.05), min(0.99, th + 0.06), 0.01).tolist()
+    return optimize_threshold(scores, y_true, fine, max_s2=args.max_s2, max_s3=args.max_s3, verbose=False)
+
+
+def run_validation(args, model, df_s1, df_s2_s3, splits, embed_model, alpha=1.0):
     """
     Threshold is tuned on the VAL fold only; the reported score comes from the
     TEST fold, which the tuning never sees. Neither fold was used to train the
-    model (see main(): they're excluded from the training sample).
+    model (main() excludes them from the training sample). Every S1 entity is
+    scored (complete competition for the one-owner rule), but only val/test
+    pairs are kept for evaluation. Compares two decision rules on the SAME
+    pair scores -- raw probability vs one-owner-normalized -- and keeps the one
+    with the better VAL score.
     """
-    df_train_s1, df_val_s1, df_test_s1 = splits
+    _, df_val_s1, df_test_s1 = splits
     if args.eval_sample and args.eval_sample > 0:
         df_val_s1 = df_val_s1.sample(n=min(args.eval_sample, len(df_val_s1)), random_state=1)
         df_test_s1 = df_test_s1.sample(n=min(args.eval_sample, len(df_test_s1)), random_state=2)
-    print(f"Evaluating on val={len(df_val_s1)} | test={len(df_test_s1)} S1 entities")
+    print(f"Evaluating on val={len(df_val_s1)} | test={len(df_test_s1)} S1 entities "
+          f"(all {len(df_s1)} S1 entities are scored so target competition is complete)")
 
     val_ids = set(df_val_s1['entity_id'].values)
     test_ids = set(df_test_s1['entity_id'].values)
@@ -155,39 +211,36 @@ def run_validation(args, model, df_s1, df_s2_s3, splits, embed_model, threshold_
     y_true_test = y_true_dict_from_split(df_test_s1)
     id_to_country = {**s1_id_to_country_map(df_val_s1), **s1_id_to_country_map(df_test_s1)}
 
-    eval_s1 = pd.concat([df_val_s1, df_test_s1], ignore_index=True)
-    all_scored = score_pairs(eval_s1, df_s2_s3, model, args, embed_model)
-    del eval_s1
-    gc.collect()
+    all_scored = score_all_pairs(df_s1, df_s2_s3, model, args, embed_model, val_ids | test_ids, alpha)
     if all_scored.empty:
         print("No candidate pairs were scored; nothing to validate.")
-        return threshold_hint
+        return {}
 
-    val_scores = all_scored[all_scored['source1_entity_id'].isin(val_ids)]
-    test_scores = all_scored[all_scored['source1_entity_id'].isin(test_ids)]
-
+    in_val = all_scored['source1_entity_id'].isin(val_ids).values
     cand_quality = evaluate_candidate_quality(
         all_scored[['source1_entity_id', 'candidate_entity_id']], {**y_true_val, **y_true_test})
-    print("\nCandidate/blocking quality (val+test combined):")
+    print("\nCandidate/blocking quality (val+test; pairs scoring >= %.2f):" % P_FLOOR)
     for k, v in cand_quality.items():
         print(f"  {k}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
 
-    print("\nThreshold sweep (val fold only):")
-    best_th, _ = optimize_threshold(val_scores, y_true_val, np.arange(0.20, 0.96, 0.05).tolist(),
-                                    max_s2=args.max_s2, max_s3=args.max_s3)
-    fine = np.arange(max(0.05, best_th - 0.05), min(0.99, best_th + 0.06), 0.01).tolist()
-    print("\nFine-tuning (val fold only):")
-    best_th, best_f05_val = optimize_threshold(val_scores, y_true_val, fine,
-                                               max_s2=args.max_s2, max_s3=args.max_s3)
-    print(f"\n★ Threshold chosen on val fold: {best_th:.2f} (val Macro F0.5 = {best_f05_val:.4f})")
+    results = {}
+    for score_type, col in (('raw', 'p'), ('owner', 'q')):
+        sc = all_scored[['source1_entity_id', 'candidate_entity_id']].assign(score=all_scored[col].values)
+        th, f_val = _tune(sc[in_val], y_true_val, args)
+        y_pred = _apply_threshold_with_capping(sc[~in_val], y_true_test, th, args.max_s2, args.max_s3)
+        f_test = evaluate_macro_f05(y_true_test, y_pred)
+        results[score_type] = (th, f_val, f_test, y_pred)
+        label = 'raw pair probability' if score_type == 'raw' else 'one-owner normalized'
+        print(f"\n[{label}] threshold tuned on val = {th:.2f} (val F0.5 {f_val:.4f}) -> TEST F0.5 {f_test:.4f}")
 
-    y_pred_test = _apply_threshold_with_capping(test_scores, y_true_test, best_th, args.max_s2, args.max_s3)
-    test_f05 = evaluate_macro_f05(y_true_test, y_pred_test)
-    print(f"\n★★★ HELD-OUT TEST FOLD Macro F0.5 = {test_f05:.4f} "
-          f"(threshold never tuned against this fold) ★★★")
+    best_type = max(results, key=lambda k: results[k][1])
+    th, f_val, f_test, y_pred_test = results[best_type]
+    print(f"\n★ Decision rule chosen on the VAL fold: {best_type} (threshold {th:.2f}, val Macro F0.5 = {f_val:.4f})")
+    print(f"\n★★★ HELD-OUT TEST FOLD Macro F0.5 = {f_test:.4f} "
+          f"(neither the threshold nor the rule was tuned against this fold) ★★★")
 
     details = evaluate_detailed(y_true_test, y_pred_test)
-    print(f"\nDetailed test-fold evaluation at threshold={best_th:.2f}:")
+    print(f"\nDetailed test-fold evaluation at threshold={th:.2f}:")
     for k, v in details.items():
         print(f"  {k}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
 
@@ -196,16 +249,19 @@ def run_validation(args, model, df_s1, df_s2_s3, splits, embed_model, threshold_
         print(f"  [{country}] macro_f05={c['macro_f05']:.4f} precision={c['mean_precision']:.4f} "
               f"recall={c['mean_recall']:.4f} n={c['total_entities']}")
 
+    cal = {}
     if model.is_fitted:
         cal = load_calibration(args.model_path)
-        cal.update({'threshold': float(best_th), 'val_macro_f05': float(best_f05_val),
-                    'test_macro_f05': float(test_f05)})
+        cal.update({'threshold': float(th), 'score_type': best_type, 'owner_alpha': float(alpha),
+                    'val_macro_f05': float(f_val), 'test_macro_f05': float(f_test),
+                    'test_macro_f05_raw': float(results['raw'][2]),
+                    'test_macro_f05_owner': float(results['owner'][2])})
         save_calibration(args.model_path, cal)
-        print(f"\nSaved validated threshold {best_th:.2f} to the model's calibration file.")
+        print(f"\nSaved validated threshold {th:.2f} ({best_type} scores) to the model's calibration file.")
 
-    del all_scored, val_scores, test_scores
+    del all_scored
     gc.collect()
-    return float(best_th)
+    return cal
 
 
 def _write_tsv(df: pd.DataFrame, path: str, first: bool):
@@ -275,22 +331,22 @@ def main(args):
             exclude_ids = set(splits[1]['entity_id'].values) | set(splits[2]['entity_id'].values)
 
     # 3. Model setup / training
-    model, cal_th = train_or_load_model(args, df_s1, df_s2_s3, args.model_path, embed_model, exclude_ids)
+    model, cal = train_or_load_model(args, df_s1, df_s2_s3, args.model_path, embed_model, exclude_ids)
     del exclude_ids
-
-    # Threshold precedence: explicit --threshold > calibrated > heuristic default.
-    best_th = args.threshold if args.threshold is not None else (
-        cal_th if cal_th is not None else HEURISTIC_DEFAULT_THRESHOLD)
 
     if splits is not None:
         print("\n═══ VALIDATION MODE: held-out val/test split, stratified by country ═══")
-        tuned_th = run_validation(args, model, df_s1, df_s2_s3, splits, embed_model, best_th)
-        if args.threshold is None:  # an explicit --threshold still wins for the output run
-            best_th = tuned_th
+        cal = run_validation(args, model, df_s1, df_s2_s3, splits, embed_model, alpha=args.owner_alpha) or cal
         del splits
         gc.collect()
 
-    print(f"\nUsing decision threshold: {best_th:.4f}")
+    # Decision rule + threshold precedence: explicit --threshold > calibrated > heuristic default.
+    use_owner = (cal.get('score_type') == 'owner') and not args.no_owner and model.is_fitted
+    alpha = float(cal.get('owner_alpha', args.owner_alpha))
+    best_th = args.threshold if args.threshold is not None else (
+        cal['threshold'] if 'threshold' in cal else HEURISTIC_DEFAULT_THRESHOLD)
+    print(f"\nUsing decision threshold: {best_th:.4f} on "
+          f"{'one-owner-normalized (alpha=%.2f)' % alpha if use_owner else 'raw pair'} scores")
     print(f"Per-source caps: max_s2={args.max_s2}, max_s3={args.max_s3}")
 
     # ─── INFERENCE: Write output files ────────────────────────────────────────
@@ -332,50 +388,42 @@ def main(args):
         cd = build_country_data(country, s1_c, s23_c, args, embed_model)
         log_memory(f"after building index for '{country}'")
         t_ids = cd.t_ids
+        s1_ids = s1_c['entity_id'].values
         n_batches = int(np.ceil(len(s1_c) / args.batch_size))
-        print(f"Processing S1 in {n_batches} batches (batch_size={args.batch_size})...")
+        print(f"Scoring S1 in {n_batches} batches (batch_size={args.batch_size})...")
 
-        for b, (b_start, b_end, sub, q_idx, t_idx, emb) in enumerate(iter_candidate_batches(cd, args, embed_model)):
-            b_t0 = time.time()
-            ids = sub['entity_id'].values
+        # candidate_pairs.tsv: every candidate that reaches scoring, streamed per batch
+        def write_candidates(b_start, sub, q_idx, t_idx):
+            nonlocal first_cand
+            if not save_candidates:
+                return
+            cand_str = _join_by_query(q_idx, t_ids[t_idx], len(sub))
+            _write_tsv(pd.DataFrame({'source1_entity_id': sub['entity_id'].values,
+                                     'candidate_entity_ids': cand_str}), args.candidate_out, first_cand)
+            first_cand = False
 
-            # candidate_pairs.tsv: every candidate that reaches scoring
-            if save_candidates:
-                cand_str = _join_by_query(q_idx, t_ids[t_idx], len(ids))
-                _write_tsv(pd.DataFrame({'source1_entity_id': ids, 'candidate_entity_ids': cand_str}),
-                           args.candidate_out, first_cand)
-                first_cand = False
+        c_t0 = time.time()
+        q, t, p = score_country_pairs(cd, model, args, embed_model, cand_writer=write_candidates)
+        log_memory(f"'{country}' scored {len(p)} plausible pairs in {time.time() - c_t0:.1f} s")
 
-            match_str = np.full(len(ids), '', dtype=object)
-            if len(q_idx) > 0:
-                feats = batch_features(cd, b_start, b_end, sub, q_idx, t_idx, emb, args.n_jobs)
-                scores = model.predict_proba(feats)
-                keep = scores >= best_th
-                surv = feats.loc[keep, ['source1_entity_id', 'candidate_entity_id']].assign(score=scores[keep])
-                del feats, scores
-                kept = cap_per_source(surv, args.max_s2, args.max_s3)
-                if not kept.empty:
-                    joined = kept.groupby('source1_entity_id', sort=False)['candidate_entity_id'].agg(','.join)
-                    match_str = pd.Series(ids).map(joined).fillna('').values
-                del surv, kept
+        # Decisions need the WHOLE country scored first: the competition for a
+        # target (one-owner rule) spans every S1 batch.
+        score = owner_normalize(t, p, len(s23_c), alpha) if use_owner else p
+        kq, kt, _ = cap_and_threshold(q, t, score, _target_is_s2(cd), best_th, args.max_s2, args.max_s3)
+        match_str = _join_by_query(kq, t_ids[kt], len(s1_c))
+        del q, t, p, score, kq, kt
 
-            _write_tsv(pd.DataFrame({'source1_entity_id': ids, 'matched_entity_ids': match_str}),
-                       args.matching_out, first_match)
-            first_match = False
-
-            n_matched = int((match_str != '').sum())
-            total_matched += n_matched
-            total_singletons += len(ids) - n_matched
-            total_processed += len(ids)
-            print(f"  Batch {b+1}/{n_batches} ({len(ids)} records) | Candidates: {len(q_idx)} | "
-                  f"Matched entities: {n_matched} | Time: {time.time() - b_t0:.2f} s")
-            del q_idx, t_idx, sub, match_str
-            gc.collect()
-            if (b + 1) % 5 == 0 or b == n_batches - 1:
-                log_memory(f"'{country}' batch {b+1}/{n_batches}")
+        _write_tsv(pd.DataFrame({'source1_entity_id': s1_ids, 'matched_entity_ids': match_str}),
+                   args.matching_out, first_match)
+        first_match = False
+        n_matched = int((match_str != '').sum())
+        total_matched += n_matched
+        total_singletons += len(s1_c) - n_matched
+        total_processed += len(s1_c)
+        print(f"  {country}: {n_matched}/{len(s1_c)} S1 entities matched")
 
         cd.free()
-        del s1_c, s23_c
+        del s1_c, s23_c, match_str
         gc.collect()
 
     close_pool()
@@ -401,11 +449,21 @@ if __name__ == "__main__":
     parser.add_argument('--matching_out', type=str, default='output/matching_results.tsv', help='Matching results TSV output path')
     parser.add_argument('--model_path', type=str, default='models/entity_model.json', help='Model checkpoint path')
     parser.add_argument('--batch_size', type=int, default=50000, help='Batch size for S1 chunking')
-    parser.add_argument('--top_k', type=int, default=30, help='Max lexical candidates per query record')
+    parser.add_argument('--top_k', type=int, default=30,
+                        help='Candidates kept per query record (the set that is scored and written to '
+                             'candidate_pairs.tsv)')
+    parser.add_argument('--pool_k', type=int, default=100,
+                        help='Size of the larger pool pulled by key overlap before the cheap TF-IDF '
+                             're-rank down to --top_k. Set equal to --top_k to disable re-ranking.')
     parser.add_argument('--threshold', type=float, default=None,
                         help='Score decision threshold. Default: the value calibrated during training '
                              '(saved beside the model as *_calibration.json); only if no calibration '
                              f'exists, {HEURISTIC_DEFAULT_THRESHOLD} for the heuristic scorer.')
+    parser.add_argument('--owner_alpha', type=float, default=1.0,
+                        help='Strength of the one-owner rule (odds exponent; see src/decision.py). '
+                             '0.5-2 measured as equivalent; 1.0 is the plain Luce choice model.')
+    parser.add_argument('--no_owner', action='store_true',
+                        help='Disable the one-owner normalization at inference (use raw pair probabilities).')
     parser.add_argument('--max_s2', type=int, default=5, help='Max S2 matches per S1 entity')
     parser.add_argument('--max_s3', type=int, default=6, help='Max S3 matches per S1 entity')
     parser.add_argument('--subset', type=int, default=0, help='Subset size for fast baseline execution (0 for full)')
