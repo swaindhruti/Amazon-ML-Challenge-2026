@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 
 from src.features import FEATURE_COLS
+from src.embeddings import load_embedding_model
 
 
 class EntityMatchingModel:
@@ -37,11 +38,11 @@ class EntityMatchingModel:
         self.is_fitted = False
 
         if self.use_transformer:
-            try:
-                from sentence_transformers import SentenceTransformer
-                self.transformer_model = SentenceTransformer('intfloat/multilingual-e5-base')
-            except Exception:
-                self.transformer_model = None
+            # load_embedding_model() (src/embeddings.py) never raises -- it
+            # returns None on any failure (no network, model unavailable,
+            # etc.) and logs why, so this stays a graceful degrade to
+            # lexical-only scoring rather than a crash either way.
+            self.transformer_model = load_embedding_model()
 
     def prepare_X(self, df_features: pd.DataFrame) -> pd.DataFrame:
         """Select model feature columns, gracefully handling missing columns.
@@ -134,8 +135,19 @@ class EntityMatchingModel:
         se = X['stripped_exact'].values if 'stripped_exact' in cols else np.zeros(len(X))
         ftm = X['first_token_match'].values if 'first_token_match' in cols else np.zeros(len(X))
 
-        # Composite score emphasizing name precision
-        name_score = 0.30 * jw + 0.25 * tsr + 0.20 * ts + 0.10 * pr + 0.15 * np.maximum(jw, tsr)
+        # Composite score emphasizing name precision. Reweighted (not just
+        # summed on top) when semantic_sim is present, so the weights still
+        # sum to 1.0 either way -- this is the one signal that can be strong
+        # for a cross-script pair even when every lexical feature reads ~0,
+        # which is exactly the case none of the other name features can
+        # cover (see src/embeddings.py). Clipped to [0, 1]: cosine
+        # similarity can go negative for genuinely dissimilar names, which
+        # should contribute nothing here rather than actively subtracting.
+        if 'semantic_sim' in cols:
+            sem = np.clip(X['semantic_sim'].values, 0.0, 1.0)
+            name_score = 0.22 * jw + 0.18 * tsr + 0.15 * ts + 0.10 * pr + 0.10 * np.maximum(jw, tsr) + 0.25 * sem
+        else:
+            name_score = 0.30 * jw + 0.25 * tsr + 0.20 * ts + 0.10 * pr + 0.15 * np.maximum(jw, tsr)
         addr_score = 0.50 * aj + 0.30 * no + 0.20 * ze
         bonus = 0.10 * se + 0.05 * ftm
 
