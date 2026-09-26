@@ -28,7 +28,7 @@ Everything below this point is either the detailed technical view of that same p
 
 ## Architecture & Data Flow
 
-### End-to-end pipeline (new nodes highlighted in green)
+### End-to-end pipeline (green = round 1 additions, blue = round 2 [R2], see below)
 
 ```mermaid
 flowchart TD
@@ -40,8 +40,9 @@ flowchart TD
         B2["Lowercase + strip punctuation"]
         B3["Strip legal suffixes<br/>(Inc/Ltd/Pvt/SARL/GmbH...)"]
         B4["Extract numeric tokens<br/>(zip / building numbers)"]
-        B5["Strip address landmark words<br/>(Near/Opposite/Behind...) [NEW]"]
-        B1 --> B2 --> B3 --> B4 --> B5
+        B5["Strip address landmark words<br/>(Near/Opposite/Behind...)"]
+        B6["Compact (space-free) name +<br/>native-script legal suffixes [R2]"]
+        B1 --> B2 --> B3 --> B4 --> B5 --> B6
     end
 
     B --> C["Country Partitioning<br/>(strict US / India / France isolation)"]
@@ -55,15 +56,20 @@ flowchart TD
         D4["Address + number keys"]
     end
 
-    D --> E["Candidate capping<br/>(top-30 by key-overlap count)"]
+    D --> E["Candidate capping<br/>(top-30 by rarity-weighted key overlap) [R2]"]
+    EM["Optional: multilingual embeddings<br/>native-script targets, FAISS/HNSW [R2]"] -.-> E
     E --> F[("candidate_pairs.tsv")]
-    E --> G["Feature Extraction<br/>(17 similarity features, features.py)"]
-    G --> H["Scoring<br/>(heuristic / XGBoost, model.py)"]
-    H --> I["Threshold + per-source cap<br/>(&lt;=5 S2, &lt;=6 S3)"]
+    E --> G["Feature Extraction, multi-core [R2]<br/>(24 lexical/address features + IDF cosine + semantic_sim)"]
+    G --> H["Scoring: XGBoost trained on blocking-derived<br/>hard pairs (training.py) [R2]<br/>(heuristic only if no checkpoint)"]
+    T[("Train split + ground truth")] -.-> TR["Train + calibrate threshold<br/>entity-level split, val/test excluded [R2]"]
+    TR -.-> H
+    H --> I["Calibrated threshold + per-source cap<br/>(&lt;=5 S2, &lt;=6 S3)"]
     I --> J[("matching_results.tsv")]
 
     classDef new fill:#d4f7dc,stroke:#2f9e44,color:#1b4332,font-weight:bold;
     class B1,B5,D3 new;
+    classDef r2 fill:#dbeafe,stroke:#1d4ed8,color:#1e3a8a,font-weight:bold;
+    class B6,E,EM,G,H,TR r2;
 ```
 
 ### What the cross-script fix actually does, on a real row pair
@@ -120,23 +126,50 @@ Previously, the threshold sweep and the reported F0.5 both ran against the *same
 
 ---
 
-## Semantic Matching (Embeddings)
+## Round 2: Why the real score was 0.6–0.7, and what changed
 
-**Why:** a real, measured SageMaker run scored 0.616 — far below the ~0.88 the local heuristic-tuning suggested — and the single largest known gap is the cross-script problem in [Roadmap #1](#roadmap-hardening-against-real-dataset-findings): transliteration + Soundex narrow it, but every one of the 17 lexical features still operates on literal characters, so they structurally cannot fully close a gap between two genuinely different alphabets. A sentence-embedding model trained to place semantically equivalent names close together *regardless of script* attacks that gap directly.
+The real SageMaker score (0.616, later 0.6–0.7) sat far below the ~0.88 local estimate. Reading the code and sampling real ground-truth pairs turned up concrete causes — each is fixed on branch `feat/trained-classifier-multicore`. **None of these fixes has been measured on the real dataset yet** (it can't be run on the 16GB dev laptop); the numbers to expect come from your next SageMaker run, so treat the table as "what was wrong and what was done", not as a score claim.
 
-**Model:** [`Graphlet-AI/eridu`](https://huggingface.co/Graphlet-AI/eridu), Apache-2.0 licensed, ~118M parameters (well under the competition's 8B limit) — created by Russell Jurney / Graphlet AI with the OpenSanctions community. It's a fine-tune of `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`, trained with contrastive learning on 2M+ labeled matching/non-matching person and company name pairs specifically for cross-language, cross-script name matching. Chosen over generic multilingual embedding models (e5, LaBSE) because it's fine-tuned for exactly this task. Candidate retrieval over embeddings at real dataset scale uses [FAISS](https://github.com/facebookresearch/faiss) (`faiss-cpu`, MIT licensed) rather than a brute-force similarity matrix, which is infeasible at millions of rows.
+| # | What was actually wrong | Evidence | Fix |
+|---|---|---|---|
+| A | **Test-time runs never used a trained model.** Only `entity_model_old_v1.json` (labelled "Overfit/Biased") existed; the default run silently fell back to the hand-weighted heuristic at a guessed threshold of 0.62. Worse, when it *did* try to train at inference time it used the in-memory **test** frames, which contain none of the training ground-truth IDs — so it trained on nothing. | `pipeline.py::train_or_load_model` (old) | Training now loads the train split explicitly; a trained model + its calibrated threshold (`models/entity_model_calibration.json`) are what inference uses. |
+| B | **Training pairs didn't look like inference pairs.** Negatives were random target rows (trivially dissimilar); a model trained that way learns "is this pair remotely similar?" and floods the output with false positives against real near-misses — exactly what F0.5 punishes 2×. Train/val were also split by *pair*, so one entity's pairs sat on both sides. | old `train_or_load_model` | New `src/training.py` + `src/country_pipeline.py`: pairs come from the **same blocking and feature code inference uses**, labelled from ground truth; split by S1 *entity*; threshold tuned against real entity-level macro F0.5. |
+| C | **The "held-out" score wasn't held out.** The training sample was drawn from all S1 rows, which could include the val/test entities. | `main()` order of operations | Val/test folds are carved out first and excluded from training. |
+| D | **The heuristic gave names 65% of the weight, but many real matches agree on address and not on name.** Sampled real ground-truth pairs: `Randle, Mock and Marini Spacsphere Inc` ↔ `Xylosol` (same address), `Hudson Mines Co` ↔ `Hudson Co Services`. Other noise seen: truncated names (`WINTERS MUNICIPALS OF`), address typos (`10ND AVENUE`), glued domain-style names (`wilfordhancock.com`), a legal suffix as a *prefix* (`LLC Moncada…`). | direct `grep` of real rows | 7 new features (`addr_token_set`, `addr_ratio`, `addr_missing`, `street_num_match`, `name_compact_ratio/partial`, `name_prefix_match`) so a trained model can learn "different name, same address" and "truncated name"; optional IDF-weighted cosine (`name_idf_cos`, `addr_idf_cos`) so common words (`pizza`, `road`, `services`) stop inflating similarity. |
+| E | **Native-script legal suffixes survived stripping.** `प्राइवेट लिमिटेड` transliterates to `praaivett limittedd`, which never matched the suffix list, so it stayed inside the "core" name. | `text_unidecode` output for Hindi/Gujarati/Telugu/Kannada/Bengali/Tamil | Those transliterated forms are now in the suffix list. |
+| F | **Candidate ranking was slow and crude.** Ranking used `Counter.update()` over numpy scalars (the slowest step) and raw key-overlap counts, so a hit on a 9,000-record generic key counted the same as a hit on a 3-record rare key when choosing which 30 candidates survive the cap. | `candidate_generation.py` | Vectorized, and each key is weighted by rarity (`1/log2(posting size + 2)`), which directly raises the recall ceiling under the same cap. |
 
-**⚠️ Not yet verified — read before relying on this.** The model name has not been directly confirmed from this development environment: one load attempt failed with a DNS error, another **segfaulted** inside sentence-transformers' fallback model-construction path (unrelated to normal Python exception handling — see `src/embeddings.py::_hub_reachable`'s docstring), and a direct HF API check returned a confusing "Invalid username or password" on a public endpoint. None of that is clean evidence the model doesn't exist — independent web search results consistently named it with specific real-looking sub-paths — but it means the actual weights have never successfully loaded anywhere this was built. **Before a real run**, on SageMaker (real internet access), run this in isolation first:
-```bash
-python3 -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('Graphlet-AI/eridu')"
-```
-If that fails, everything degrades gracefully (see `load_embedding_model()`) rather than crashing the pipeline — you just silently don't get the semantic-matching benefit, which is worth knowing rather than assuming.
+### Multi-core
+Previously almost everything ran on one core. Now (`--n_jobs`, default = every visible CPU):
 
-**How it's wired in** (`--use_embeddings`, off by default so existing behavior is unchanged unless requested):
-- **Blocking**: per country, target-pool names are encoded once and indexed with FAISS; each S1 batch's semantic nearest-neighbors (`--emb_top_k`, default 5) are unioned with the existing lexical/Soundex candidates (`merge_candidate_pairs`, deduped) — this is what actually surfaces a cross-script pair that shares zero characters, words, or Soundex codes.
-- **Scoring**: cosine similarity between the query and candidate embedding becomes an 18th feature, `semantic_sim` — used by XGBoost when a real model is trained with `use_transformer=True`, and blended into the heuristic scorer too (reweighted, not just added on top, so the heuristic's weights still sum to 1.0) since no trained checkpoint exists yet and the heuristic is what actually runs by default.
+| Stage | How it uses cores |
+|---|---|
+| 5 name + 2 address fuzzy scorers (the hot loop) | RapidFuzz `process.cpdist(..., workers=N)` — its own C++ thread pool, no Python loop, no pickling |
+| Per-pair token/structure features | fork-based process pool (`src/parallel.py`), created *before* the big dataframes/torch/xgboost exist (forking afterwards is slow and can hang) |
+| Text cleaning of 12M+ rows | same process pool, chunked |
+| XGBoost training/inference | `n_jobs` set explicitly |
+| Embedding model | `torch.set_num_threads`, `faiss.omp_set_num_threads` |
 
-**Known unverified cost:** encoding an entire country's target pool (millions of rows for the largest countries) through a transformer, even a small one, on CPU has not been timed at real scale — test with `--subset` first, and watch the `[embeddings]`/timing log lines before committing to a full run.
+Verified on synthetic data: the parallel and serial feature paths give identical values (200k pairs, 0.73s vs 1.92s on this 10-core laptop with 3 workers — the real speed-up depends on the SageMaker instance's core count). **In Docker, the container sees the host's CPUs unless you cap it with `--cpus`.**
+
+### What is verified vs. not
+- ✅ Run end-to-end on a synthetic dataset (train + validate + inference + load-checkpoint paths) with a stand-in for XGBoost, since the real one can't import on the dev Mac. That checks the plumbing (splits, exclusion, calibration save/load, output format), **not** accuracy — the synthetic data is trivially easy.
+- ✅ Unit-level checks: parallel == serial features, vectorized capping matches expected output (and does 3M pairs in ~0.4s), embedding-candidate path with a fake encoder.
+- ❌ Not measured: real F0.5, real recall ceiling, real training time, real memory at full scale. **0.98 is not something this branch claims** — run `--is_train --validate` and read the printed test-fold number and per-country breakdown; that, not this README, is the answer.
+
+---
+
+## Semantic Matching (Embeddings) — optional
+
+A supplement, **not** the main scoring engine (the trained classifier carries the score). Cross-script matching is already attacked lexically by transliteration + Soundex; an embedding model can catch what those miss.
+
+**Model:** [`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`](https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2) — Apache-2.0, ~118M parameters (competition limit is 8B), from the UKP Lab / sentence-transformers project (Reimers & Gurevych, EMNLP 2020); covers 50+ languages including Hindi, Bengali, Gujarati, Tamil, Marathi, Urdu. Used as-is. It replaces `Graphlet-AI/eridu`, which could not be loaded on the team's SageMaker instance (eridu was itself fine-tuned from this model). Retrieval uses [FAISS](https://github.com/facebookresearch/faiss) (`faiss-cpu`, MIT) — exact search for small pools, HNSW for pools over 200k vectors (an exact search of a 50k-query batch against 1M+ vectors is tens of trillions of operations per batch).
+
+**Offline instances:** if SageMaker can't reach huggingface.co, download once elsewhere and pass a folder: `--embedding_model models/hf/minilm` (see `src/embeddings.py` docstring for the one-liner). A local directory is loaded with no network check.
+
+**Cost control (`--embed_countries`, default `india`):** encoding is the most expensive step. Only **native-script targets** are encoded (Latin-script targets are already handled lexically), and only for the listed countries. Pairs whose target wasn't encoded get `semantic_sim = NaN` (XGBoost's "missing"), not a fake 0. Encoding time at real scale is **still unmeasured** — try `--subset` first.
+
+**Wiring:** `--use_embeddings` adds each query's `--emb_top_k` nearest semantic neighbours to the lexical candidates (deduped) and a `semantic_sim` feature. If a model was trained with embeddings, run inference with the same flag (a mismatch is warned about, and the missing feature is NaN-filled instead of crashing).
 
 ---
 
@@ -173,12 +206,12 @@ The items below come from actually reading the real `student_resource/dataset` f
 | 4 | **Real file sizes are much larger than the docs assumed** (train alone is Source1 2.2M + Source2 5.0M + Source3 5.3M ≈ 12.5M rows; test is a similar size again) — current code loaded Source2+Source3 fully into memory with several duplicated derived text columns living far longer than needed | 🔶 Partially addressed | Three changes, each individually verified at small/measurable scale (full verification needs a real SageMaker run — the actual dataset can't be loaded on the 16GB machine this was developed on): **(a)** `country_clean` is now `pd.Categorical` instead of plain strings — measured on a 100k-row proxy at the real countries' proportions, this column alone drops ~60x (a straight-line extrapolation puts the full ~12.5M-row column at ~757MB→~13MB, though that's an estimate, not a measured full run). **(b)** The per-country target-pool text arrays (`t_clean`/`t_norm`/`t_stripped`/`t_addrs_clean`/`t_addrs_norm`/`t_nums`) previously stayed alive as loose Python lists for that country's *entire* processing, duplicating `df_target_proc`'s own copy — now freed immediately after being consumed, in both `pipeline.py`'s main loop and `_run_scoring_pipeline` (this already matched `optimize_submission.py`'s existing, better practice — pipeline.py was the inconsistent one). **(c)** New `src/memlog.py` prints real peak-RSS at each checkpoint (after loading, after each country's index build, every 5 batches), so the *next* SageMaker run produces actual measured numbers instead of more static estimates. |
 | 5 | Threshold defaults disagreed across `pipeline.py` (0.80) and `optimize_submission.py` (0.62) | ✅ **Done** | Both now default to `0.62` with an explicit CLI help-text note that it's a placeholder, not a verified optimum — the real value has to come from actually running `--validate` (see #6) on SageMaker, which this environment can't do at full scale. |
 | 6 | F0.5 was tuned **and** reported on the same data (no held-out split) — the 0.88–0.99 range seen so far was never a trustworthy, reproducible number | ✅ **Done** | New `src/splits.py`: stratified (by country) train/val/test split. `pipeline.py --validate` now tunes the threshold on the **val** fold only and reports Macro F0.5 on the **test** fold, which the tuning step never sees, plus a per-country breakdown (`evaluate_detailed_by_country`) so a France-specific regression can't hide behind US/India volume. Verified on a small real 3,000-row sample (zero overlap between folds, country ratios preserved, perfect-prediction sanity check = 1.0) — a full run still needs to happen on SageMaker. |
-| 7 | No trained XGBoost checkpoint exists; every run currently falls back to the hand-weighted heuristic scorer | 🔲 To do | Needs an actual training run on SageMaker — can't be done on a 16GB laptop against the real 10M+ row files. |
+| 7 | No trained XGBoost checkpoint exists; every run currently falls back to the hand-weighted heuristic scorer | 🔶 **Implemented, unrun** | `src/training.py` trains on blocking-derived pairs and saves model + calibrated threshold (see [Round 2](#round-2-why-the-real-score-was-0607-and-what-changed) A–C). Needs one real SageMaker `--is_train --validate` run to actually produce the checkpoint and the real score. |
 | 8 | `candidate_pairs.tsv` size/recall-ceiling was never measured, even though the competition grades it separately from the leaderboard score | ✅ **Done** | New `evaluate_candidate_quality()` in `evaluate.py`: reports avg/median candidates per entity, total candidate pairs, and **recall ceiling** (the fraction of true matches that actually survive into the candidate set, regardless of score) — wired into `pipeline.py --validate`'s output. |
 | 9 | Training sample for calibration used the first 50k S1 rows — no guarantee the raw file isn't grouped by country | ✅ **Done** | New `stratified_sample()` in `src/splits.py`, wired into both `pipeline.py::train_or_load_model` and `optimize_submission.py --train`. Verified on a deliberately US-heavy-first real slice (2000 US then 500 India rows): the old `df.iloc[:200]` gave **100% US, 0% India**; the new sampler gives **160:40 (4:1)**, matching the true population ratio. |
 | 10 | Address "landmark" filler words (`Near`, `Opposite`, `Behind`, ...) weren't filtered out of address blocking/features | ✅ **Done** | Verified real frequency first (`near` in ~5.5% of India addresses, `opposite` in ~3.4%, plus `behind`/`beside`/`backside`/`above`/`below`/`front`/`infront`/`landmark`). New `ADDRESS_LANDMARK_WORDS` + `strip_landmark_words()` in `preprocessing.py`, applied to `business_address_norm` (fixes `features.py`'s address similarity) and directly inside `candidate_generation.py::extract_keys` (fixes blocking's `aw1`/`aw2` keys). Verified on a real address: blocking's `aw1` key shifted from the near-useless `near` to the actually-specific `1106` (a building number). |
 
-**Status: 8/10 done, 1 partial.** Remaining: #4 needs a real SageMaker run to confirm the estimated memory savings actually hold at full scale, and #7 needs a real SageMaker training run — neither is something that can be faked or fully verified on a 16GB laptop against a ~24M-row dataset.
+**Status: 8/10 done, 2 need a real SageMaker run.** #4 needs one to confirm the estimated memory savings hold at full scale; #7 is implemented but has never produced a real checkpoint — neither can be verified on a 16GB laptop against a ~24M-row dataset.
 
 ---
 
@@ -196,8 +229,7 @@ AmazonMLC/
 │   └── business_entity_resolution/
 │       └── code/
 │           ├── README.md                              # Code guide
-│           ├── requirements.txt                       # Core Python dependencies (installed by default)
-│           ├── requirements-optional.txt              # Only for use_transformer=True (torch + sentence-transformers)
+│           ├── requirements.txt                       # Python dependencies (torch: install the CPU wheel, see file)
 │           └── src/
 │               ├── candidate_generation.py            # Memory-compact inverted index & batching
 │               ├── blocking.py                        # Backward-compatibility alias
@@ -207,8 +239,11 @@ AmazonMLC/
 │               ├── evaluate.py                        # Macro F_0.5, candidate-quality & per-country evaluation
 │               ├── splits.py                          # Stratified train/val/test split for honest evaluation
 │               ├── memlog.py                          # Peak-RSS logging checkpoints
-│               ├── embeddings.py                       # Semantic (cross-script) candidate augmentation + scoring
-│               └── pipeline.py                        # Country-partitioned execution pipeline
+│               ├── embeddings.py                      # Optional multilingual-embedding candidates + semantic_sim
+│               ├── parallel.py                        # Process pool + native thread config (multi-core)
+│               ├── country_pipeline.py                # Shared per-country blocking/TF-IDF/embedding/feature builder
+│               ├── training.py                        # Hard-pair training, entity-level split, threshold calibration
+│               └── pipeline.py                        # Orchestration: train/load, validate, inference
 └── student_resource/                                  # Fetched separately -- see Dataset Setup
     └── dataset/                                       # Competition datasets
 ```
@@ -231,39 +266,43 @@ This is the official challenge archive and unpacks to `student_resource/`, conta
 ## Quickstart
 
 ### 1. Install Dependencies
+Inside a virtualenv (nothing is installed globally):
 ```bash
+python3 -m venv .venv && source .venv/bin/activate
+# CPU-only torch first (a plain `pip install torch` pulls the multi-GB CUDA build):
+pip install torch==2.3.1 --index-url https://download.pytorch.org/whl/cpu
 pip install -r aads_submission/business_entity_resolution/code/requirements.txt
 ```
-This installs everything the default pipeline needs. It deliberately excludes `torch`/`sentence-transformers` (~2GB+) since nothing runs with `use_transformer=True` by default — only install `requirements-optional.txt` on top of this if you're specifically turning that on:
-```bash
-pip install -r aads_submission/business_entity_resolution/code/requirements-optional.txt
-```
+`torch`/`sentence-transformers`/`faiss-cpu` are only exercised with `--use_embeddings`; skip the torch line and the three packages if you don't need it.
 
-### 2. Run Entity Resolution Pipeline
+### 2. Train, calibrate, and measure the real held-out score (do this first)
 ```bash
-export PYTHONPATH=.
-python3 aads_submission/business_entity_resolution/code/src/pipeline.py \
+export PYTHONPATH=aads_submission/business_entity_resolution/code
+python3 -m src.pipeline \
+    --data_dir student_resource/dataset \
+    --is_train --validate
+```
+Trains XGBoost on blocking-derived hard pairs (`--train_sample`, default 80k S1 entities), saves `models/entity_model.json` + `models/entity_model_calibration.json`, then scores the held-out val/test folds and prints the **test-fold Macro F0.5**, the recall ceiling, and a per-country breakdown. Uses every CPU by default (`--n_jobs N` to cap).
+
+### 3. Run inference on the test split
+```bash
+python3 -m src.pipeline \
     --data_dir student_resource/dataset \
     --matching_out output/matching_results.tsv \
     --candidate_out output/candidate_pairs.tsv
 ```
+Loads the trained model and its calibrated threshold automatically (an explicit `--threshold` overrides it). If no checkpoint exists it trains one first from `data_dir/train`.
 
-### 3. Fast Verification Run (Subset)
+With embeddings (optional; use the same flag for training and inference):
 ```bash
-export PYTHONPATH=.
-python3 aads_submission/business_entity_resolution/code/src/pipeline.py \
-    --data_dir student_resource/dataset \
-    --subset 2000
+python3 -m src.pipeline --data_dir student_resource/dataset --is_train --validate --use_embeddings
 ```
 
-### 4. Held-Out Validation (real F0.5, not a same-data-tuned estimate)
+### 4. Fast Verification Run (Subset)
 ```bash
-export PYTHONPATH=.
-python3 aads_submission/business_entity_resolution/code/src/pipeline.py \
-    --data_dir student_resource/dataset \
-    --is_train --validate
+python3 -m src.pipeline --data_dir student_resource/dataset --is_train --validate --subset 20000 --train_sample 10000
 ```
-Prints candidate-quality stats (recall ceiling, avg candidates/entity), the threshold chosen on the val fold, and the final Macro F0.5 measured on the held-out test fold, plus a per-country breakdown. Also prints `[mem] peak RSS so far` checkpoints (see `src/memlog.py`) — worth watching on the first real SageMaker run to confirm the memory-usage estimates in the [Roadmap](#roadmap-hardening-against-real-dataset-findings) (#4).
+Also prints `[mem] peak RSS so far` checkpoints (see `src/memlog.py`) — worth watching on the first real SageMaker run to confirm the memory estimates in the [Roadmap](#roadmap-hardening-against-real-dataset-findings) (#4).
 
 ---
 
@@ -276,7 +315,16 @@ A `Dockerfile` at the repo root packages the whole pipeline into one portable im
 docker build -t aads-entity-resolution .
 ```
 
-### Run the entire pipeline end-to-end
+### 1. Train + validate (writes the model and calibrated threshold into `./models`)
+```bash
+docker run --rm \
+    -v "$(pwd)/student_resource/dataset:/data" \
+    -v "$(pwd)/output:/output" \
+    -v "$(pwd)/models:/models" \
+    aads-entity-resolution --data_dir /data --model_path /models/entity_model.json --is_train --validate
+```
+
+### 2. Inference (the image's default command)
 ```bash
 docker run --rm \
     -v "$(pwd)/student_resource/dataset:/data" \
@@ -284,13 +332,13 @@ docker run --rm \
     -v "$(pwd)/models:/models" \
     aads-entity-resolution
 ```
-That's it — this uses the image's default command and produces `output/matching_results.tsv` + `output/candidate_pairs.tsv` on your host, exactly like running `pipeline.py` directly (Quickstart step 2).
+Produces `output/matching_results.tsv` + `output/candidate_pairs.tsv`, using the model and `entity_model_calibration.json` from `./models`. Any flags you append after the image name **replace** the default command, so repeat `--data_dir`, `--model_path`, etc. (as in step 1).
 
-To run any other mode instead (subset smoke test, `--is_train --validate`, etc.), just append the flags you'd normally pass to `pipeline.py` after the image name — they replace the default command:
-```bash
-docker run --rm -v "$(pwd)/student_resource/dataset:/data" \
-    aads-entity-resolution --data_dir /data --is_train --validate
-```
+### Cores and memory
+The container sees all of the host's CPUs by default, and the pipeline uses them all (`--n_jobs 0`). To cap it: `docker run --cpus 8 ... aads-entity-resolution ... --n_jobs 8` (pass both — `--cpus` limits the container, `--n_jobs` sizes the worker pools; a mismatch just oversubscribes).
+
+### Embeddings in Docker
+Add `--use_embeddings` to both commands. The model downloads into `/models/hf` (`HF_HOME`), i.e. into your mounted `./models` folder, once. On an instance with no internet, put a pre-downloaded copy at `./models/hf/minilm` and add `--embedding_model /models/hf/minilm`. The image installs the **CPU** PyTorch wheel; it does not use a GPU.
 
 ---
 

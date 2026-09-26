@@ -7,11 +7,12 @@ This repository contains the high-performance, memory-optimized Business Entity 
 The pipeline resolves entities from a deduplicated reference source (Source 1) against large, noisy target pools (Source 2 and Source 3) totaling over 11 million records across dynamic open-set countries (US, India, France).
 
 ### Key Optimizations for F₀.₅
-- **Precision-tuned threshold** (default 0.80) — F₀.₅ weights precision 2× over recall
+- **Calibrated threshold** — tuned against entity-level macro F₀.₅ on held-out entities during training and saved beside the model (F₀.₅ weights precision 2× over recall); an explicit `--threshold` overrides it
 - **Per-source capping** — at most top-5 S2 + top-6 S3 per S1 entity (data-driven from ground truth)
-- **17 engineered features** including legal suffix-stripped name similarity
+- **24 lexical/address features** (+ optional IDF cosine and `semantic_sim`): suffix-stripped name similarity, address token-set/ratio, truncation and glued-name features
 - **International legal suffix removal** — LLC, Inc, Ltd, SA, SAS, SARL, GmbH, etc.
-- **5:1 negative ratio** training with early stopping for precision emphasis
+- **Training on blocking-derived hard pairs** (same code path as inference), entity-level train/val split, early stopping
+- **Multi-core** feature building (`--n_jobs`, default all CPUs)
 
 ### 32 GB RAM Architecture Optimizations
 1. **S1 Batch Chunking**: Slices Source 1 into batches (default: `batch_size = 50,000`). Blocking, feature extraction, scoring, and output writing are executed per batch, followed by immediate `gc.collect()`.
@@ -31,7 +32,11 @@ code/
     ├── __init__.py
     ├── candidate_generation.py        # CompactInvertedIndex (np.uint32), pruning, candidate capping
     ├── blocking.py                    # Backward-compatibility alias
-    ├── features.py                    # 17 features: RapidFuzz, suffix-stripped JW/TSR, structural
+    ├── features.py                    # 24 features + optional IDF/semantic; multi-threaded RapidFuzz (cpdist)
+    ├── country_pipeline.py            # Shared per-country blocking + TF-IDF + embeddings + features
+    ├── training.py                    # Hard-pair training, threshold calibration, calibration JSON
+    ├── parallel.py                    # Process pool + native thread config
+    ├── embeddings.py                  # Optional multilingual embeddings (--use_embeddings)
     ├── model.py                       # XGBoost (500 trees) + high-precision heuristic fallback
     ├── preprocessing.py               # Text cleaning, legal suffix stripping, abbreviation normalization
     ├── evaluate.py                    # Macro F_0.5 with per-source capping and threshold tuning
@@ -61,8 +66,9 @@ python3 -m src.pipeline \
     --model_path models/entity_model_v2.json \
     --matching_out output/matching_results_train.tsv \
     --candidate_out output/candidate_pairs_train.tsv \
-    --threshold 0.80 --max_s2 5 --max_s3 6
+    --max_s2 5 --max_s3 6
 ```
+Writes the model plus `models/entity_model_v2_calibration.json` (the threshold tuned on held-out entities).
 
 ### 2. Test Inference (Full Submission Run)
 ```bash
@@ -72,8 +78,9 @@ python3 -m src.pipeline \
     --model_path models/entity_model_v2.json \
     --matching_out output/matching_results.tsv \
     --candidate_out output/candidate_pairs.tsv \
-    --threshold <OPTIMAL_FROM_TRAINING> --max_s2 5 --max_s3 6
+    --max_s2 5 --max_s3 6
 ```
+The calibrated threshold is read automatically from the calibration file next to the model (pass `--threshold` only to override it).
 
 ### 3. Fast Subset Run (Local Testing)
 ```bash
