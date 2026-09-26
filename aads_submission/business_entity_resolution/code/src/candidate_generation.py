@@ -71,14 +71,16 @@ class CompactInvertedIndex:
     Automatically prunes high-frequency keys (> max_block_size) to avoid
     quadratic candidate blowups and OOM.
     """
-    def __init__(self, max_block_size: int = 10000, max_candidates: int = 30):
+    def __init__(self, max_block_size: int = 10000, max_candidates: int = 30,
+                 compound_keys: bool = True):
         self.max_block_size = max_block_size
         self.max_candidates = max_candidates
+        self.compound_keys = compound_keys
         self.index: Dict[str, np.ndarray] = {}
         self.num_records = 0
 
     @staticmethod
-    def extract_keys(name: str, addr: str, nums: str) -> List[str]:
+    def extract_keys(name: str, addr: str, nums: str, compound: bool = True) -> List[str]:
         """
         Builds the set of inverted-index keys for one record. A candidate pair
         is proposed whenever a query and a target record share ANY key, so
@@ -151,6 +153,31 @@ class CompactInvertedIndex:
             if len(addr_words) > 1:
                 keys.append('aw2:' + addr_words[1])
 
+        if compound and name:
+            # Compound keys exist for SCALE. Any key held by more than
+            # max_block_size records is dropped from the index entirely, and
+            # on the real ~6M-record US pool many common name words and city
+            # tokens exceed that -- an entity whose name keys are all common
+            # would then lose its name-based candidates. Pairing a name token
+            # with the state (or street) keeps blocks small and precise: two
+            # records sharing "global" AND "tx" are far rarer than either
+            # alone. The state is the 2-letter code preprocessing.clean_address
+            # appends as the LAST token of the address (absent -> no key).
+            addr_toks = addr.split() if addr else []
+            state = addr_toks[-1] if addr_toks and len(addr_toks[-1]) == 2 and addr_toks[-1].isalpha() else ''
+            if state:
+                if len(name) >= 4:
+                    keys.append('p4_st:' + name[:4] + '_' + state)
+                sig = [w for w in name.split() if w not in GENERIC_STOP_WORDS and len(w) >= 3]
+                if sig:
+                    keys.append('w1_st:' + sig[0] + '_' + state)
+                    if len(sig) > 1:
+                        keys.append('w2_st:' + sig[1] + '_' + state)
+            if addr_words:
+                sig = [w for w in name.split() if w not in GENERIC_STOP_WORDS and len(w) >= 3]
+                if sig:
+                    keys.append('w1_aw1:' + sig[0] + '_' + addr_words[0])
+
         return keys
 
     def build(self, names: Sequence[str], addrs: Sequence[str], nums: Sequence[str]):
@@ -168,7 +195,7 @@ class CompactInvertedIndex:
         raw_index = defaultdict(list)
 
         for i in range(self.num_records):
-            keys = self.extract_keys(names[i], addrs[i], nums[i])
+            keys = self.extract_keys(names[i], addrs[i], nums[i], self.compound_keys)
             for k in keys:
                 raw_index[k].append(i)
 
@@ -213,7 +240,7 @@ class CompactInvertedIndex:
         n_queries = len(query_names)
 
         for q_i in range(n_queries):
-            keys = self.extract_keys(query_names[q_i], query_addrs[q_i], query_nums[q_i])
+            keys = self.extract_keys(query_names[q_i], query_addrs[q_i], query_nums[q_i], self.compound_keys)
             if not keys:
                 continue
 

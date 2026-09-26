@@ -349,6 +349,17 @@ def main(args):
           f"{'one-owner-normalized (alpha=%.2f)' % alpha if use_owner else 'raw pair'} scores")
     print(f"Per-source caps: max_s2={args.max_s2}, max_s3={args.max_s3}")
 
+    # A training run only needs the model + calibration. Re-scoring the whole
+    # train split just to write outputs for it would repeat the most expensive
+    # pass (hours at real scale) for files nobody submits; --infer_after_train
+    # opts back in.
+    if args.is_train and not args.infer_after_train:
+        close_pool()
+        print(f"\nTraining run finished in {time.time() - start_time:.1f} seconds; model at {args.model_path}. "
+              f"Skipping inference over the train split (pass --infer_after_train to write outputs for it). "
+              f"Run without --is_train on the test split to produce the submission files.")
+        return
+
     # ─── INFERENCE: Write output files ────────────────────────────────────────
     print(f"\n═══ INFERENCE: Writing outputs with threshold={best_th:.4f} ═══")
     os.makedirs(os.path.dirname(os.path.abspath(args.matching_out)), exist_ok=True)
@@ -455,6 +466,13 @@ if __name__ == "__main__":
     parser.add_argument('--pool_k', type=int, default=100,
                         help='Size of the larger pool pulled by key overlap before the cheap TF-IDF '
                              're-rank down to --top_k. Set equal to --top_k to disable re-ranking.')
+    parser.add_argument('--no_compound_keys', action='store_true',
+                        help='Disable the compound blocking keys (name word + state / street). They exist '
+                             'to keep recall up when common keys exceed the 10k block limit at full scale; '
+                             'this flag is for A/B comparison on a sub-world.')
+    parser.add_argument('--infer_after_train', action='store_true',
+                        help='With --is_train: also write matching/candidate files for the train split '
+                             '(off by default; it repeats the full scoring pass).')
     parser.add_argument('--threshold', type=float, default=None,
                         help='Score decision threshold. Default: the value calibrated during training '
                              '(saved beside the model as *_calibration.json); only if no calibration '

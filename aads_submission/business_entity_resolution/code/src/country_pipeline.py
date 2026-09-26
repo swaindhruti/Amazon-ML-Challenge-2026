@@ -110,7 +110,8 @@ def build_country_data(country, s1_country: pd.DataFrame, s2_s3_country: pd.Data
     cd.t_ids = s2_s3_country['entity_id'].values
 
     t0 = time.time()
-    cd.index = CompactInvertedIndex(max_block_size=10000, max_candidates=args.top_k)
+    cd.index = CompactInvertedIndex(max_block_size=10000, max_candidates=args.top_k,
+                                    compound_keys=not getattr(args, 'no_compound_keys', False))
     cd.index.build(t['clean'], t['addr_clean'], t['nums'])
     print(f"Built inverted index for '{country}' in {time.time() - t0:.2f} s | Keys: {len(cd.index.index)}")
 
