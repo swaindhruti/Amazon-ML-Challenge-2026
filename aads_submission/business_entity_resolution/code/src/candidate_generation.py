@@ -236,6 +236,29 @@ class CompactInvertedIndex:
                 
         return np.array(all_query_idx, dtype=np.int32), np.array(all_target_idx, dtype=np.uint32)
 
+def merge_candidate_pairs(
+    q1: np.ndarray, t1: np.ndarray, q2: np.ndarray, t2: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Unions two (query_idx, target_idx) candidate arrays -- e.g. lexical
+    (CompactInvertedIndex.query_candidates) and semantic
+    (EmbeddingCandidateIndex.query, see src/embeddings.py) -- deduping exact
+    (q, t) pairs so scoring never sees the same candidate pair twice.
+
+    Encodes each pair as a single int64 sort key instead of a Python-level
+    loop/set: safe because q fits in int32 and t in uint32 by construction
+    everywhere these arrays are built (batch sizes and target-pool sizes are
+    both far below 2**31).
+    """
+    if len(q1) == 0 and len(q2) == 0:
+        return np.array([], dtype=np.int32), np.array([], dtype=np.uint32)
+    all_q = np.concatenate([q1, q2]).astype(np.int64)
+    all_t = np.concatenate([t1, t2]).astype(np.int64)
+    combined = (all_q << 32) | all_t
+    _, unique_idx = np.unique(combined, return_index=True)
+    return all_q[unique_idx].astype(np.int32), all_t[unique_idx].astype(np.uint32)
+
+
 def generate_candidates(
     df_s1: pd.DataFrame, 
     df_s2_s3: pd.DataFrame, 
