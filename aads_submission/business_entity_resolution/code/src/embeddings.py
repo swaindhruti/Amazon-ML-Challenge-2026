@@ -1,78 +1,59 @@
 """
-Semantic (embedding-based) candidate augmentation and similarity scoring.
+Optional semantic (embedding-based) candidate augmentation and similarity.
 
 Why this exists: cross-script name matching (see preprocessing.py's
 transliterate_to_ascii and candidate_generation.py's Soundex keys) narrows
-but doesn't close the gap between Source 1 (~100% Latin-script) and the
-~40% of India's Source 2/3 pool written in native script (Devanagari,
-Tamil, Telugu, Kannada, Gujarati, Bengali, Malayalam, Oriya, Gurmukhi --
-see README roadmap #1). A sentence-embedding model trained to place
-semantically equivalent business names close together *regardless of
-script* attacks that gap directly, instead of relying on transliteration
-quality.
+but doesn't close the gap between Source 1 (~100% Latin-script) and the ~40%
+of India's Source 2/3 pool written in native script (Devanagari, Tamil,
+Telugu, Kannada, Gujarati, Bengali, Malayalam, ...). A multilingual
+sentence-embedding model places the same name close together regardless of
+script, which attacks that gap directly instead of relying on transliteration
+quality alone.
 
-Model credit: Graphlet-AI/eridu
-(https://huggingface.co/Graphlet-AI/eridu), Apache-2.0 licensed, ~118M
-parameters (well under the competition's 8B-parameter limit) -- created by
-Russell Jurney / Graphlet AI in collaboration with the OpenSanctions
-community. It's a fine-tune of
-sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2, trained with
-contrastive learning on 2M+ labeled matching/non-matching person and
-company name pairs specifically for cross-language, cross-script name
-matching -- chosen over generic multilingual embedding models (e5, LaBSE)
-because it's fine-tuned for exactly this task rather than general-purpose
-sentence similarity. Used here as-is (no further fine-tuning yet); nothing
-about this codebase prevents fine-tuning it further on this competition's
-own ground truth pairs, which is a natural next step, not something this
-module currently does.
+This is a SUPPLEMENT, not the main scoring engine: the trained classifier over
+lexical/address/IDF features (see training.py) carries the score. Embeddings
+are off by default (--use_embeddings) because encoding is the single most
+expensive step in the pipeline (a transformer forward pass per name).
 
-Honesty note -- read this before a real run: this module was written and
-reviewed for correctness (API usage, shapes, graceful-fallback behavior)
-without ever successfully loading the actual model weights. The dev
-sandbox this was built in has unreliable/likely-proxied network access to
-huggingface.co: one attempt failed with a DNS resolution error, another
-segfaulted inside sentence-transformers' fallback model-construction path
-(not a catchable Python exception -- see _hub_reachable()'s docstring),
-and a direct API check returned "Invalid username or password" on a
-public, unauthenticated endpoint, which looks like anti-bot/rate-limit
-interference rather than a real 404. None of that is consistent evidence
-that the model doesn't exist -- independent web search results
-consistently named "Graphlet-AI/eridu" with specific real-looking sub-paths
-(/tree/main, /commits/main/README.md) -- but it also means THE MODEL NAME
-ITSELF HAS NOT BEEN DIRECTLY CONFIRMED FROM THIS ENVIRONMENT.
+Model credit: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+(https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2),
+Apache-2.0, ~118M parameters (far under the competition's 8B limit), from the
+UKP Lab / sentence-transformers project (Reimers & Gurevych, "Making
+Monolingual Sentence Embeddings Multilingual using Knowledge Distillation",
+EMNLP 2020). Supports 50+ languages including Hindi, Bengali, Gujarati, Tamil,
+Marathi and Urdu. Used as-is, no fine-tuning.
 
-Before relying on this for a real run: on SageMaker (real internet access),
-run `python -c "from sentence_transformers import SentenceTransformer;
-SentenceTransformer('Graphlet-AI/eridu')"` in isolation FIRST. If the name
-is wrong, has moved, or is gated, that single line will tell you in
-seconds, rather than discovering it after a long pipeline run. Everything
-in this module degrades gracefully (see load_embedding_model) if that load
-fails, so a wrong name costs recall on cross-script cases, not a crash --
-but you should know the actual load status rather than assume it worked.
+History: this module originally targeted Graphlet-AI/eridu; that repository
+could not be loaded on the team's SageMaker instance, so it was replaced with
+the public model above (which eridu itself was fine-tuned from).
+
+Offline / locked-down instances: if the instance cannot reach huggingface.co,
+download the model once somewhere that can and point at the folder:
+    python -c "from sentence_transformers import SentenceTransformer as S; \\
+               S('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2').save('models/hf/minilm')"
+    python -m src.pipeline ... --use_embeddings --embedding_model models/hf/minilm
+A local directory is loaded directly with no network check.
+
+Nothing here has been run end-to-end against the real weights in the dev
+sandbox; every failure path degrades to "embeddings unavailable" (lexical
+pipeline continues) rather than crashing.
 """
+import os
 import numpy as np
 from typing import List, Optional, Tuple
 
-EMBEDDING_MODEL_NAME = "Graphlet-AI/eridu"
+EMBEDDING_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
 _model_cache = {}
 
 
 def _hub_reachable(host: str = "huggingface.co", timeout: float = 3.0) -> bool:
     """
-    Cheap, low-level (plain socket, not requests/urllib3) reachability check
-    before attempting SentenceTransformer(...). Exists because a real
-    failure was observed during development: when the model can't be found
-    locally AND the network is unreachable, sentence-transformers falls
-    back to constructing a generic Transformer+Pooling model from scratch,
-    and that fallback path segfaulted rather than raising a catchable
-    Python exception -- try/except cannot protect against that. Checking
-    reachability first and skipping the load entirely when unreachable
-    avoids ever entering that code path. (The crash was reproduced on an
-    old macOS system Python built against LibreSSL rather than OpenSSL, a
-    known source of unrelated low-level SSL/networking issues -- plausibly
-    an artifact of that specific environment rather than a general risk,
-    but this check costs nothing and removes the failure mode either way.)
+    Cheap plain-socket reachability check before attempting a Hub download.
+    Exists because a hard crash (segfault, not a catchable exception) was seen
+    inside sentence-transformers' fallback path when the model could not be
+    found AND the network was unreachable; skipping the load when the Hub is
+    unreachable avoids ever entering that path.
     """
     import socket
     try:
@@ -84,29 +65,31 @@ def _hub_reachable(host: str = "huggingface.co", timeout: float = 3.0) -> bool:
         return False
 
 
-def load_embedding_model(model_name: str = EMBEDDING_MODEL_NAME):
+def load_embedding_model(model_name: Optional[str] = None, n_threads: Optional[int] = None):
     """
     Loads (and caches) the sentence-transformers model. Returns None on ANY
-    failure -- no internet, model not cached, sentence-transformers/torch
-    not installed, out of memory -- so every caller in this module degrades
-    to "embeddings unavailable" instead of crashing the whole pipeline.
-    Lexical blocking (candidate_generation.py) and the 17 hand-engineered
-    features (features.py) work completely independently of this, so a
-    missing embedding model costs recall on the cross-script cases, not a
-    failed run.
+    failure -- no internet, model not cached, libraries missing, out of memory
+    -- so callers degrade to lexical-only instead of crashing the run.
+    model_name may be a Hub id or a local directory (see module docstring).
     """
+    model_name = model_name or os.environ.get('EMBEDDING_MODEL') or EMBEDDING_MODEL_NAME
     if model_name in _model_cache:
         return _model_cache[model_name]
 
-    if not _hub_reachable():
+    is_local = os.path.isdir(model_name)
+    offline = os.environ.get('HF_HUB_OFFLINE') == '1'
+    if not is_local and not offline and not _hub_reachable():
         print(f"  [embeddings] huggingface.co not reachable; skipping '{model_name}' -- "
-              f"continuing with lexical-only blocking and scoring.")
+              f"continuing with lexical-only blocking and scoring. (Pre-download the model and "
+              f"pass --embedding_model <local dir> to use it offline.)")
         _model_cache[model_name] = None
         return None
 
     try:
+        from src.parallel import configure_native_threads
+        configure_native_threads(n_threads)
         from sentence_transformers import SentenceTransformer
-        model = SentenceTransformer(model_name)
+        model = SentenceTransformer(model_name, device='cpu')
     except Exception as e:
         print(f"  [embeddings] Could not load '{model_name}' ({e}); "
               f"continuing with lexical-only blocking and scoring.")
@@ -117,11 +100,8 @@ def load_embedding_model(model_name: str = EMBEDDING_MODEL_NAME):
 
 def encode_texts(model, texts: List[str], batch_size: int = 256) -> Optional[np.ndarray]:
     """
-    Batch-encodes texts to L2-normalized embeddings, so cosine similarity
-    between any two rows is a plain dot product (used by both
-    EmbeddingCandidateIndex and the semantic_sim feature in features.py).
-    Returns None if model is None, propagating "not available" rather than
-    raising, so callers can fall back cleanly.
+    Batch-encodes texts to L2-normalized float32 embeddings (cosine similarity
+    == dot product). Returns None if model is None so callers can fall back.
     """
     if model is None:
         return None
@@ -137,39 +117,70 @@ def encode_texts(model, texts: List[str], batch_size: int = 256) -> Optional[np.
     return embeddings.astype(np.float32)
 
 
+class EmbeddingRows:
+    """
+    Embeddings for only a SUBSET of a target pool (e.g. the rows whose raw name
+    was in a non-Latin script -- the only rows lexical matching struggles
+    with), addressable by the full pool's row index. Rows that were never
+    encoded report `present=False`; their pair similarity is NaN (XGBoost's
+    'missing'), not a fake 0.0, so the model can tell "not encoded" from
+    "encoded and dissimilar".
+    """
+
+    def __init__(self, n_total: int, encoded_rows: np.ndarray, embeddings: np.ndarray):
+        self.encoded_rows = np.asarray(encoded_rows, dtype=np.int64)
+        self.embeddings = embeddings
+        self.row_of = np.full(n_total, -1, dtype=np.int32)
+        self.row_of[self.encoded_rows] = np.arange(len(self.encoded_rows), dtype=np.int32)
+
+    def pair_sim(self, query_embeddings: np.ndarray, q_idx: np.ndarray, t_idx: np.ndarray,
+                 chunk: int = 200_000) -> np.ndarray:
+        n = len(q_idx)
+        sim = np.full(n, np.nan, dtype=np.float32)
+        rows = self.row_of[t_idx]
+        present = np.nonzero(rows >= 0)[0]
+        for s in range(0, len(present), chunk):
+            sel = present[s:s + chunk]
+            sim[sel] = np.einsum('ij,ij->i', query_embeddings[q_idx[sel]], self.embeddings[rows[sel]])
+        return sim
+
+
 class EmbeddingCandidateIndex:
     """
-    FAISS-backed nearest-neighbor index over one country partition's
-    target-pool embeddings. Proposes candidates that lexical/phonetic
-    blocking (CompactInvertedIndex) can miss entirely -- e.g. a name
-    written in a script with no shared prefix, word, or Soundex code
-    against its Source 1 counterpart, but whose semantic embedding IS close
-    if the model generalizes across scripts.
+    FAISS nearest-neighbour index over (a subset of) one country's target
+    embeddings. Proposes candidates lexical/phonetic blocking can miss
+    entirely (a name in a script sharing no prefix, word, or Soundex code with
+    its Latin counterpart, but semantically close).
 
-    Deliberately NOT a brute-force numpy similarity matrix: an exact
-    query-batch x target-pool matrix is infeasible at real scale (a few
-    million target rows x a few hundred embedding dims x a 50k query batch
-    is tens of billions of floats for one batch alone). FAISS's
-    IndexFlatIP still computes an EXACT inner-product search, just with a
-    far smaller memory footprint and a heavily optimized inner loop --
-    that's what makes this tractable, not an approximation trade-off.
+    Small pools use an exact flat inner-product index. Large pools use HNSW
+    (approximate, ~99% recall at these settings): an exact search of a 50k
+    query batch against ~1M+ 384-dim vectors costs tens of trillions of
+    floating-point operations per batch, which is not tractable, while HNSW
+    answers the same queries in seconds after a one-off build.
+
+    row_ids (optional): maps index positions back to full-pool target rows,
+    for an index built over a subset.
     """
 
-    def __init__(self, target_embeddings: Optional[np.ndarray]):
+    HNSW_THRESHOLD = 200_000
+
+    def __init__(self, target_embeddings: Optional[np.ndarray], row_ids: Optional[np.ndarray] = None):
         self.available = target_embeddings is not None and len(target_embeddings) > 0
         self.index = None
+        self.row_ids = None if row_ids is None else np.asarray(row_ids, dtype=np.int64)
         if self.available:
             import faiss
             dim = target_embeddings.shape[1]
-            self.index = faiss.IndexFlatIP(dim)  # inner product == cosine sim on normalized vectors
+            if len(target_embeddings) >= self.HNSW_THRESHOLD:
+                self.index = faiss.IndexHNSWFlat(dim, 32, faiss.METRIC_INNER_PRODUCT)
+                self.index.hnsw.efConstruction = 80
+                self.index.hnsw.efSearch = 64
+            else:
+                self.index = faiss.IndexFlatIP(dim)
             self.index.add(np.ascontiguousarray(target_embeddings))
 
     def query(self, query_embeddings: Optional[np.ndarray], k: int) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Returns (query_indices, target_indices) flattened in the same shape
-        CompactInvertedIndex.query_candidates uses, so the two candidate
-        sets can be concatenated and deduplicated directly by the caller.
-        """
+        """(query_indices, target_indices) flattened like CompactInvertedIndex.query_candidates."""
         if not self.available or query_embeddings is None or len(query_embeddings) == 0:
             return np.array([], dtype=np.int32), np.array([], dtype=np.uint32)
 
@@ -178,7 +189,9 @@ class EmbeddingCandidateIndex:
 
         n_queries = query_embeddings.shape[0]
         q_idx = np.repeat(np.arange(n_queries, dtype=np.int32), k)
-        flat_targets = neighbor_idx.reshape(-1)
-        # FAISS returns -1 for a slot when fewer than k neighbors exist.
-        valid = flat_targets >= 0
-        return q_idx[valid], flat_targets[valid].astype(np.uint32)
+        flat = neighbor_idx.reshape(-1)
+        valid = flat >= 0  # FAISS pads with -1 when fewer than k neighbours exist
+        flat = flat[valid]
+        if self.row_ids is not None:
+            flat = self.row_ids[flat]
+        return q_idx[valid], flat.astype(np.uint32)
