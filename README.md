@@ -5,7 +5,7 @@ A scalable, memory-efficient Machine Learning solution for Business Entity Resol
 
 Designed to process $> 11$ million multi-country records within **32 GB RAM** on an AWS SageMaker `ml.m5.2xlarge` instance without triggering the Linux OOM killer.
 
-**Contents:** [How It Works](#how-it-works-plain-english) · [Architecture & Data Flow](#architecture--data-flow) · [Key Highlights](#key-highlights--innovations) · [Roadmap](#roadmap-hardening-against-real-dataset-findings) · [Directory Structure](#directory-structure) · [Dataset Setup](#dataset-setup) · [Quickstart](#quickstart) · [Docker](#docker) · [Output Format](#output-format)
+**Contents:** [How It Works](#how-it-works-plain-english) · [Architecture & Data Flow](#architecture--data-flow) · [Semantic Matching](#semantic-matching-embeddings) · [Key Highlights](#key-highlights--innovations) · [Roadmap](#roadmap-hardening-against-real-dataset-findings) · [Directory Structure](#directory-structure) · [Dataset Setup](#dataset-setup) · [Quickstart](#quickstart) · [Docker](#docker) · [Output Format](#output-format)
 
 ---
 
@@ -120,6 +120,26 @@ Previously, the threshold sweep and the reported F0.5 both ran against the *same
 
 ---
 
+## Semantic Matching (Embeddings)
+
+**Why:** a real, measured SageMaker run scored 0.616 — far below the ~0.88 the local heuristic-tuning suggested — and the single largest known gap is the cross-script problem in [Roadmap #1](#roadmap-hardening-against-real-dataset-findings): transliteration + Soundex narrow it, but every one of the 17 lexical features still operates on literal characters, so they structurally cannot fully close a gap between two genuinely different alphabets. A sentence-embedding model trained to place semantically equivalent names close together *regardless of script* attacks that gap directly.
+
+**Model:** [`Graphlet-AI/eridu`](https://huggingface.co/Graphlet-AI/eridu), Apache-2.0 licensed, ~118M parameters (well under the competition's 8B limit) — created by Russell Jurney / Graphlet AI with the OpenSanctions community. It's a fine-tune of `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`, trained with contrastive learning on 2M+ labeled matching/non-matching person and company name pairs specifically for cross-language, cross-script name matching. Chosen over generic multilingual embedding models (e5, LaBSE) because it's fine-tuned for exactly this task. Candidate retrieval over embeddings at real dataset scale uses [FAISS](https://github.com/facebookresearch/faiss) (`faiss-cpu`, MIT licensed) rather than a brute-force similarity matrix, which is infeasible at millions of rows.
+
+**⚠️ Not yet verified — read before relying on this.** The model name has not been directly confirmed from this development environment: one load attempt failed with a DNS error, another **segfaulted** inside sentence-transformers' fallback model-construction path (unrelated to normal Python exception handling — see `src/embeddings.py::_hub_reachable`'s docstring), and a direct HF API check returned a confusing "Invalid username or password" on a public endpoint. None of that is clean evidence the model doesn't exist — independent web search results consistently named it with specific real-looking sub-paths — but it means the actual weights have never successfully loaded anywhere this was built. **Before a real run**, on SageMaker (real internet access), run this in isolation first:
+```bash
+python3 -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('Graphlet-AI/eridu')"
+```
+If that fails, everything degrades gracefully (see `load_embedding_model()`) rather than crashing the pipeline — you just silently don't get the semantic-matching benefit, which is worth knowing rather than assuming.
+
+**How it's wired in** (`--use_embeddings`, off by default so existing behavior is unchanged unless requested):
+- **Blocking**: per country, target-pool names are encoded once and indexed with FAISS; each S1 batch's semantic nearest-neighbors (`--emb_top_k`, default 5) are unioned with the existing lexical/Soundex candidates (`merge_candidate_pairs`, deduped) — this is what actually surfaces a cross-script pair that shares zero characters, words, or Soundex codes.
+- **Scoring**: cosine similarity between the query and candidate embedding becomes an 18th feature, `semantic_sim` — used by XGBoost when a real model is trained with `use_transformer=True`, and blended into the heuristic scorer too (reweighted, not just added on top, so the heuristic's weights still sum to 1.0) since no trained checkpoint exists yet and the heuristic is what actually runs by default.
+
+**Known unverified cost:** encoding an entire country's target pool (millions of rows for the largest countries) through a transformer, even a small one, on CPU has not been timed at real scale — test with `--subset` first, and watch the `[embeddings]`/timing log lines before committing to a full run.
+
+---
+
 ## Key Highlights & Innovations
 
 1. **Compact Inverted Indexing (`np.uint32`)**:
@@ -187,6 +207,7 @@ AmazonMLC/
 │               ├── evaluate.py                        # Macro F_0.5, candidate-quality & per-country evaluation
 │               ├── splits.py                          # Stratified train/val/test split for honest evaluation
 │               ├── memlog.py                          # Peak-RSS logging checkpoints
+│               ├── embeddings.py                       # Semantic (cross-script) candidate augmentation + scoring
 │               └── pipeline.py                        # Country-partitioned execution pipeline
 └── student_resource/                                  # Fetched separately -- see Dataset Setup
     └── dataset/                                       # Competition datasets
