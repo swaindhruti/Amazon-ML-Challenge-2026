@@ -20,8 +20,10 @@ import numpy as np
 import pandas as pd
 
 from src.preprocessing import prepare_text_chunk
-from src.candidate_generation import CompactInvertedIndex, merge_candidate_pairs
-from src.features import build_batch_features
+from src.candidate_generation import (
+    CompactInvertedIndex, merge_candidate_pairs, rerank_score, top_k_per_query,
+)
+from src.features import build_batch_features, _sparse_pair_cosine
 from src.embeddings import encode_texts, EmbeddingCandidateIndex, EmbeddingRows
 from src.parallel import map_chunks, split_ranges, resolve_n_jobs
 
@@ -38,10 +40,11 @@ def prepare_text_arrays(df: pd.DataFrame) -> dict:
     """
     names = df['business_name'].values
     addrs = df['business_address'].values
+    countries = df['country'].values
     ranges = split_ranges(len(df), min_chunk=100_000)
-    tasks = [(names[s:e], addrs[s:e]) for s, e in ranges] or [(names, addrs)]
+    tasks = [(names[s:e], addrs[s:e], countries[s:e]) for s, e in ranges] or [(names, addrs, countries)]
     parts = map_chunks(_prep_task, tasks)
-    keys = ['clean', 'norm', 'stripped', 'compact', 'addr_clean', 'addr_norm', 'nums', 'native']
+    keys = ['clean', 'norm', 'stripped', 'compact', 'addr_clean', 'addr_norm', 'nums', 'native', 'state']
     return {k: [x for p in parts for x in p[i]] for i, k in enumerate(keys)}
 
 
@@ -53,6 +56,7 @@ def _proc_frame(df_raw: pd.DataFrame, t: dict) -> pd.DataFrame:
         'business_name_compact': t['compact'],
         'business_address_norm': t['addr_norm'],
         'address_numbers': t['nums'],
+        'state': t['state'],
     })
 
 
@@ -151,10 +155,21 @@ def iter_candidate_batches(cd: CountryData, args, embed_model=None) -> Iterator[
     n = len(cd.df_s1_proc)
     for b_start in range(0, n, args.batch_size):
         b_end = min(b_start + args.batch_size, n)
-        q_idx, t_idx = cd.index.query_candidates(
+        pool_k = max(getattr(args, 'pool_k', args.top_k), args.top_k)
+        q_idx, t_idx, key_w = cd.index.query_candidates(
             cd.q_clean[b_start:b_end], cd.q_addr_clean[b_start:b_end], cd.q_nums[b_start:b_end],
-            max_candidates=args.top_k,
+            max_candidates=pool_k, return_scores=True,
         )
+        if pool_k > args.top_k and len(q_idx) > 0:
+            # Larger pool by key overlap, then the top_k by cheap TF-IDF similarity
+            # (see candidate_generation.rerank_score for why).
+            zeros = np.zeros(len(q_idx), dtype=np.float32)
+            name_cos = zeros if cd.tfidf_name is None else _sparse_pair_cosine(
+                cd.tfidf_name[0][b_start:b_end], cd.tfidf_name[1], q_idx, t_idx)
+            addr_cos = zeros if cd.tfidf_addr is None else _sparse_pair_cosine(
+                cd.tfidf_addr[0][b_start:b_end], cd.tfidf_addr[1], q_idx, t_idx)
+            keep = top_k_per_query(q_idx, rerank_score(name_cos, addr_cos, key_w), args.top_k)
+            q_idx, t_idx = q_idx[keep], t_idx[keep]
         batch_emb = None
         if cd.emb_index is not None:
             batch_emb = encode_texts(embed_model, cd.s1_raw_names[b_start:b_end])

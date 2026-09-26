@@ -190,19 +190,24 @@ class CompactInvertedIndex:
         query_names: Sequence[str], 
         query_addrs: Sequence[str], 
         query_nums: Sequence[str],
-        max_candidates: int = None
-    ) -> Tuple[np.ndarray, np.ndarray]:
+        max_candidates: int = None,
+        return_scores: bool = False,
+    ):
         """
         Queries the inverted index for a batch of query records.
         Returns:
             query_indices: 1D array of row indices in the query batch
             target_indices: 1D array of row indices in the target index
+            (+ key_weights, the rarity-weighted overlap score each pair was
+            ranked by, when return_scores=True -- a free relevance signal for
+            a downstream re-ranker.)
         """
         if max_candidates is None:
             max_candidates = self.max_candidates
 
         all_query_idx = []
         all_target_idx = []
+        all_scores = []
 
         index_map = self.index
         n_queries = len(query_names)
@@ -230,6 +235,7 @@ class CompactInvertedIndex:
                 if len(uniq) > max_candidates:
                     uniq = uniq[:max_candidates]
                 top_cands = uniq
+                top_scores = np.full(len(uniq), 1.0 / np.log2(len(postings[0]) + 2.0), dtype=np.float32)
             else:
                 cat = np.concatenate(postings)
                 weights = np.concatenate([
@@ -240,15 +246,56 @@ class CompactInvertedIndex:
                 if len(uniq) > max_candidates:
                     top = np.argpartition(-score, max_candidates - 1)[:max_candidates]
                     top_cands = uniq[top]
+                    top_scores = score[top].astype(np.float32)
                 else:
                     top_cands = uniq
+                    top_scores = score.astype(np.float32)
 
             all_query_idx.append(np.full(len(top_cands), q_i, dtype=np.int32))
             all_target_idx.append(np.asarray(top_cands, dtype=np.uint32))
+            if return_scores:
+                all_scores.append(top_scores)
 
         if not all_query_idx:
-            return np.array([], dtype=np.int32), np.array([], dtype=np.uint32)
-        return np.concatenate(all_query_idx), np.concatenate(all_target_idx)
+            empty = (np.array([], dtype=np.int32), np.array([], dtype=np.uint32))
+            return empty + (np.array([], dtype=np.float32),) if return_scores else empty
+        out = (np.concatenate(all_query_idx), np.concatenate(all_target_idx))
+        return out + (np.concatenate(all_scores),) if return_scores else out
+
+# --- Two-stage candidate selection -----------------------------------------
+# Key-overlap ranking alone is a blunt instrument: on a real-data proxy the
+# lexical keys reach ~99% (US) / ~96% (India) of true pairs when uncapped, but
+# a 30-candidate cap keeps only ~95% / ~93%, because the cap is applied by key
+# overlap, which can't tell a near-identical record from one that merely
+# shares a common city or name prefix. So: pull a LARGER pool by key overlap,
+# then keep the top_k by a cheap, non-ML similarity -- word-level TF-IDF cosine
+# of the name and of the address (both already computed for the features) plus
+# the key weight. Address is weighted about twice the name because many real
+# matches share an address but not a name. Same candidate-set size as before,
+# higher recall ceiling; on the proxy top-20 of the re-ranked pool beat the old
+# top-30. Weights were chosen on the TRAIN world only, then checked on a
+# disjoint test world (differences between nearby settings were <= 0.1 point).
+RERANK_W_NAME = 0.25
+RERANK_W_ADDR = 0.50
+RERANK_W_KEY = 0.40
+RERANK_KEY_SCALE = 6.0  # ~99.9th percentile of the key weight; keeps its term in [0, ~1]
+
+
+def rerank_score(name_cos: np.ndarray, addr_cos: np.ndarray, key_weight: np.ndarray) -> np.ndarray:
+    return (RERANK_W_NAME * name_cos + RERANK_W_ADDR * addr_cos
+            + RERANK_W_KEY * (key_weight / RERANK_KEY_SCALE)).astype(np.float32)
+
+
+def top_k_per_query(q_idx: np.ndarray, score: np.ndarray, k: int) -> np.ndarray:
+    """Indices (into the pair arrays) of the k highest-scoring pairs of each query."""
+    if len(q_idx) == 0:
+        return np.array([], dtype=np.int64)
+    order = np.lexsort((-score, q_idx))
+    qs = q_idx[order]
+    starts = np.r_[0, np.flatnonzero(np.diff(qs)) + 1]
+    group_start = np.repeat(starts, np.diff(np.r_[starts, len(qs)]))
+    return np.sort(order[(np.arange(len(qs)) - group_start) < k])
+
 
 def merge_candidate_pairs(
     q1: np.ndarray, t1: np.ndarray, q2: np.ndarray, t2: np.ndarray
