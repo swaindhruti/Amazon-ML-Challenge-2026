@@ -19,8 +19,13 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Only the lean, always-needed dependencies -- see requirements.txt for why
-# torch/sentence-transformers are deliberately excluded from this image.
+# CPU-only PyTorch first, from PyTorch's CPU wheel index (~200MB instead of the
+# ~2GB+ CUDA build a plain `pip install torch` pulls from PyPI). Installed
+# before requirements.txt so its `torch==2.3.1` pin is already satisfied and
+# pip doesn't fetch the CUDA wheel over it. Needed by the optional
+# --use_embeddings path (sentence-transformers).
+RUN pip install --no-cache-dir torch==2.3.1 --index-url https://download.pytorch.org/whl/cpu
+
 COPY aads_submission/business_entity_resolution/code/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
@@ -32,6 +37,10 @@ COPY optimize_submission.py /app/optimize_submission.py
 
 ENV PYTHONPATH=/app/aads_submission/business_entity_resolution/code
 ENV PYTHONUNBUFFERED=1
+# Hugging Face model downloads (only used with --use_embeddings) are cached
+# under the mounted /models volume, so the model is downloaded once and
+# survives container restarts instead of being re-fetched every run.
+ENV HF_HOME=/models/hf
 
 # /data, /output, /models are plain directories in the image, not declared
 # as VOLUMEs -- every documented `docker run` in the README explicitly
