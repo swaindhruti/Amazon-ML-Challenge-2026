@@ -19,7 +19,7 @@ from src.preprocessing import (
     load_data, clean_text, normalize_abbreviations,
     extract_numerical_tokens, strip_legal_suffixes, strip_landmark_words,
 )
-from src.candidate_generation import CompactInvertedIndex
+from src.candidate_generation import CompactInvertedIndex, merge_candidate_pairs
 from src.features import build_batch_features, FEATURE_COLS
 from src.model import EntityMatchingModel
 from src.evaluate import (
@@ -30,6 +30,7 @@ from src.splits import (
     stratified_country_split, y_true_dict_from_split, s1_id_to_country_map, stratified_sample,
 )
 from src.memlog import log_memory
+from src.embeddings import load_embedding_model, encode_texts, EmbeddingCandidateIndex
 
 
 def build_y_true_dict(df_gt: pd.DataFrame) -> dict:
@@ -63,7 +64,12 @@ def train_or_load_model(args, df_s1: pd.DataFrame, df_s2_s3: pd.DataFrame, model
     Loads an existing model or trains one on ground truth pairs if --is_train is set.
     Returns (model, best_threshold).
     """
-    model = EntityMatchingModel()
+    # use_transformer must match --use_embeddings, not just default False --
+    # otherwise semantic_sim gets computed (build_batch_features) and fed
+    # into the DataFrame, but EntityMatchingModel.prepare_X() only ever
+    # includes it when use_transformer is True, silently discarding the one
+    # feature --use_embeddings exists to add.
+    model = EntityMatchingModel(use_transformer=args.use_embeddings)
     best_th = args.threshold
 
     # 1. If not training, attempt to load existing model
@@ -208,6 +214,22 @@ def assemble_matches_per_source(
         final_ids = [cid for cid, _ in s2_pairs[:max_s2]] + [cid for cid, _ in s3_pairs[:max_s3]]
         result[s1_id] = final_ids
     return result
+
+
+def build_country_embedding_index(embed_model, target_names):
+    """
+    Encodes one country's target-pool names and wraps them in a FAISS
+    nearest-neighbor index (see src/embeddings.py). Returns
+    (target_embeddings, emb_index); both None if embed_model is None, so
+    every caller can check `if emb_index is not None` once and skip the
+    entire semantic path rather than threading None-checks through every
+    downstream call.
+    """
+    if embed_model is None:
+        return None, None
+    target_embeddings = encode_texts(embed_model, target_names)
+    emb_index = EmbeddingCandidateIndex(target_embeddings)
+    return target_embeddings, emb_index
 
 
 def main(args):
@@ -375,6 +397,12 @@ def main(args):
     total_matches_found = 0
     total_singletons = 0
 
+    # Loaded once, reused across every country (cached in src.embeddings).
+    # Off by default (--use_embeddings) since target-pool encoding is a real,
+    # unverified cost at real dataset scale (see src/embeddings.py) -- this
+    # makes it an explicit opt-in rather than changing default behavior.
+    embed_model = load_embedding_model() if args.use_embeddings else None
+
     for country in unique_countries:
         s1_country = df_s1[df_s1['country_clean'] == country].reset_index(drop=True)
         s2_s3_country = df_s2_s3[df_s2_s3['country_clean'] == country].reset_index(drop=True)
@@ -424,6 +452,19 @@ def main(args):
         index.build(t_clean, t_addrs_clean, t_nums)
         print(f"Built inverted index for '{country}' in {time.time() - idx_t0:.2f} s | Keys: {len(index.index)}")
 
+        # Semantic candidate index (optional, see build_country_embedding_index).
+        # Encodes the WHOLE country's target pool once -- this is the known,
+        # unverified cost at real scale (millions of rows through a
+        # transformer on CPU); nothing else in this loop pays that cost more
+        # than once per country.
+        emb_t0 = time.time()
+        target_embeddings, emb_index = build_country_embedding_index(
+            embed_model, df_target_proc['business_name_norm'].values
+        )
+        if emb_index is not None:
+            print(f"Built embedding index for '{country}' in {time.time() - emb_t0:.2f} s "
+                  f"({len(df_target_proc)} targets)")
+
         # t_clean/t_norm/t_stripped/t_addrs_clean/t_addrs_norm/t_nums are all
         # consumed now (into either the index or df_target_proc) -- for the
         # largest country (e.g. US, the majority of S2+S3), holding all six
@@ -468,6 +509,17 @@ def main(args):
                 max_candidates=args.top_k
             )
 
+            # Semantic candidates, merged in alongside the lexical ones --
+            # this is what actually closes the cross-script gap: a pair with
+            # zero shared characters/keys can still surface here if the
+            # embedding model places them close together. merge_candidate_pairs
+            # dedupes so scoring never sees the same (query, target) twice.
+            batch_query_embeddings = None
+            if emb_index is not None:
+                batch_query_embeddings = encode_texts(embed_model, sub_s1_df['business_name_norm'].values)
+                emb_q_idx, emb_t_idx = emb_index.query(batch_query_embeddings, k=args.emb_top_k)
+                q_idx, t_idx = merge_candidate_pairs(q_idx, t_idx, emb_q_idx, emb_t_idx)
+
             # Optional streaming to candidate_pairs.tsv
             if save_candidates:
                 cand_map = defaultdict(list)
@@ -489,7 +541,10 @@ def main(args):
             # Feature extraction, scoring, and per-source capping
             scored_map = defaultdict(list)  # s1_id -> [(cand_id, score)]
             if len(q_idx) > 0:
-                df_features = build_batch_features(sub_s1_df, df_target_proc, q_idx, t_idx)
+                df_features = build_batch_features(
+                    sub_s1_df, df_target_proc, q_idx, t_idx,
+                    query_embeddings=batch_query_embeddings, target_embeddings=target_embeddings,
+                )
                 scores = model.predict_proba(df_features)
                 df_features['score'] = scores
 
@@ -541,6 +596,7 @@ def main(args):
 
         # Free country memory
         del index, df_target_proc, df_s1_proc, s1_country, s2_s3_country
+        del target_embeddings, emb_index
         gc.collect()
 
     print(f"\n==========================================")
@@ -566,6 +622,11 @@ def _run_scoring_pipeline(
         set(df_s1['country_clean'].unique()).union(set(df_s2_s3['country_clean'].unique()))
     ))
 
+    # Mirrors main()'s embedding wiring exactly -- otherwise --validate would
+    # report a number for a lexical-only pipeline different from the one
+    # inference actually runs, which defeats the point of validating it.
+    embed_model = load_embedding_model() if args.use_embeddings else None
+
     for country in unique_countries:
         s1_country = df_s1[df_s1['country_clean'] == country].reset_index(drop=True)
         s2_s3_country = df_s2_s3[df_s2_s3['country_clean'] == country].reset_index(drop=True)
@@ -586,6 +647,10 @@ def _run_scoring_pipeline(
         index = CompactInvertedIndex(max_block_size=10000, max_candidates=args.top_k)
         index.build(t_clean, t_addrs_clean, t_nums)
         del t_clean, t_norm, t_stripped, t_addrs_clean, t_addrs_norm, t_nums
+
+        target_embeddings, emb_index = build_country_embedding_index(
+            embed_model, df_target_proc['business_name_norm'].values
+        )
 
         q_clean, q_norm, q_stripped, q_addrs_clean, q_addrs_norm, q_nums = prepare_text_arrays(s1_country)
         df_s1_proc = pd.DataFrame({
@@ -613,8 +678,17 @@ def _run_scoring_pipeline(
                 max_candidates=args.top_k
             )
 
+            batch_query_embeddings = None
+            if emb_index is not None:
+                batch_query_embeddings = encode_texts(embed_model, sub_s1_df['business_name_norm'].values)
+                emb_q_idx, emb_t_idx = emb_index.query(batch_query_embeddings, k=args.emb_top_k)
+                q_idx, t_idx = merge_candidate_pairs(q_idx, t_idx, emb_q_idx, emb_t_idx)
+
             if len(q_idx) > 0:
-                df_features = build_batch_features(sub_s1_df, df_target_proc, q_idx, t_idx)
+                df_features = build_batch_features(
+                    sub_s1_df, df_target_proc, q_idx, t_idx,
+                    query_embeddings=batch_query_embeddings, target_embeddings=target_embeddings,
+                )
                 scores = model.predict_proba(df_features)
                 df_features['score'] = scores
                 all_scores.append(df_features[['source1_entity_id', 'candidate_entity_id', 'score']])
@@ -624,6 +698,7 @@ def _run_scoring_pipeline(
             gc.collect()
 
         del index, df_target_proc, df_s1_proc, s1_country, s2_s3_country
+        del target_embeddings, emb_index
         gc.collect()
 
     if all_scores:
@@ -650,5 +725,15 @@ if __name__ == "__main__":
     parser.add_argument('--max_s2', type=int, default=5, help='Max S2 matches per S1 entity')
     parser.add_argument('--max_s3', type=int, default=6, help='Max S3 matches per S1 entity')
     parser.add_argument('--subset', type=int, default=0, help='Subset size for fast baseline execution (0 for full)')
+    parser.add_argument('--use_embeddings', action='store_true',
+                         help='Augment lexical blocking with a semantic embedding model '
+                              '(Graphlet-AI/eridu, see src/embeddings.py) to catch cross-script '
+                              'matches (e.g. Latin vs. Devanagari) lexical blocking misses entirely. '
+                              'Off by default: real encoding cost at full dataset scale has not been '
+                              'measured yet -- test with --subset first before a full run.')
+    parser.add_argument('--emb_top_k', type=int, default=5,
+                         help='Max semantic-neighbor candidates per query record, kept small '
+                              'relative to --top_k so embedding candidates supplement rather than '
+                              'dominate the candidate set (candidate-set size is graded separately).')
     args = parser.parse_args()
     main(args)
