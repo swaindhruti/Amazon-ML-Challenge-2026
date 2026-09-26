@@ -212,29 +212,43 @@ class CompactInvertedIndex:
             if not keys:
                 continue
 
-            # Counter, not a plain set union: a target record matching on
-            # MORE of the query's keys is a stronger candidate than one
-            # matching on just one, so key-overlap count doubles as a cheap
-            # relevance ranking used below to pick which candidates survive
-            # the max_candidates cap.
-            cand_counts = Counter()
-            for k in keys:
-                if k in index_map:
-                    cand_counts.update(index_map[k])
-
-            if not cand_counts:
+            postings = [index_map[k] for k in keys if k in index_map]
+            if not postings:
                 continue
 
-            if len(cand_counts) > max_candidates:
-                top_cands = [c for c, _ in cand_counts.most_common(max_candidates)]
+            # Rank candidates by RARITY-weighted key overlap, not raw overlap
+            # count. A target that shares a key held by 9,000 other records
+            # (e.g. a common name prefix) says little; one sharing a key held
+            # by 3 records says a lot. Each posting list contributes
+            # 1/log2(len+2) per member, so a couple of rare-key hits outrank
+            # many common-key hits -- which is what decides who survives the
+            # max_candidates cap, i.e. directly what the recall ceiling is.
+            # (Also vectorized: the previous Counter.update() iterated numpy
+            # scalars one at a time, the slowest part of this whole stage.)
+            if len(postings) == 1:
+                uniq = postings[0]
+                if len(uniq) > max_candidates:
+                    uniq = uniq[:max_candidates]
+                top_cands = uniq
             else:
-                top_cands = list(cand_counts.keys())
-                
-            for t_i in top_cands:
-                all_query_idx.append(q_i)
-                all_target_idx.append(t_i)
-                
-        return np.array(all_query_idx, dtype=np.int32), np.array(all_target_idx, dtype=np.uint32)
+                cat = np.concatenate(postings)
+                weights = np.concatenate([
+                    np.full(len(p), 1.0 / np.log2(len(p) + 2.0), dtype=np.float32) for p in postings
+                ])
+                uniq, inverse = np.unique(cat, return_inverse=True)
+                score = np.bincount(inverse, weights=weights, minlength=len(uniq))
+                if len(uniq) > max_candidates:
+                    top = np.argpartition(-score, max_candidates - 1)[:max_candidates]
+                    top_cands = uniq[top]
+                else:
+                    top_cands = uniq
+
+            all_query_idx.append(np.full(len(top_cands), q_i, dtype=np.int32))
+            all_target_idx.append(np.asarray(top_cands, dtype=np.uint32))
+
+        if not all_query_idx:
+            return np.array([], dtype=np.int32), np.array([], dtype=np.uint32)
+        return np.concatenate(all_query_idx), np.concatenate(all_target_idx)
 
 def merge_candidate_pairs(
     q1: np.ndarray, t1: np.ndarray, q2: np.ndarray, t2: np.ndarray
