@@ -228,22 +228,42 @@ def _apply_threshold_with_capping(
     """
     Generate predictions at a given threshold with per-source capping.
     """
-    df_pred = df_scores[df_scores['score'] >= threshold].copy()
+    df_pred = df_scores.loc[df_scores['score'] >= threshold,
+                            ['source1_entity_id', 'candidate_entity_id', 'score']]
 
     y_pred = {s1_id: set() for s1_id in y_true.keys()}
 
     if df_pred.empty:
         return y_pred
 
-    for s1_id, group in df_pred.groupby('source1_entity_id'):
-        if s1_id not in y_pred:
-            continue
-
-        # Separate S2 and S3 candidates
-        s2_cands = group[group['candidate_entity_id'].str.startswith('S2-')].nlargest(max_s2, 'score')
-        s3_cands = group[group['candidate_entity_id'].str.startswith('S3-')].nlargest(max_s3, 'score')
-
-        matches = set(s2_cands['candidate_entity_id'].tolist() + s3_cands['candidate_entity_id'].tolist())
-        y_pred[s1_id] = matches
+    kept = cap_per_source(df_pred, max_s2, max_s3)
+    for s1_id, cand in zip(kept['source1_entity_id'].values, kept['candidate_entity_id'].values):
+        bucket = y_pred.get(s1_id)
+        if bucket is not None:
+            bucket.add(cand)
 
     return y_pred
+
+
+def cap_per_source(df_pred: pd.DataFrame, max_s2: int, max_s3: int) -> pd.DataFrame:
+    """
+    Keeps, per S1 entity, only the top max_s2 S2 candidates and top max_s3 S3
+    candidates by score (rows with any other ID prefix are dropped), returned
+    sorted best-first. df_pred needs ['source1_entity_id', 'candidate_entity_id',
+    'score'] and should already be threshold-filtered.
+
+    Vectorized (rank within (entity, source) group): the earlier per-entity
+    Python loop with two nlargest() calls cost minutes per call on a realistic
+    validation set, and the threshold sweep calls this ~30 times. Shared by
+    validation scoring and the real inference output so both apply the
+    identical capping rule.
+    """
+    if df_pred.empty:
+        return df_pred
+    is_s2 = df_pred['candidate_entity_id'].str.startswith('S2-').values
+    is_s3 = df_pred['candidate_entity_id'].str.startswith('S3-').values
+    valid = is_s2 | is_s3
+    df = df_pred[valid].assign(_s2=is_s2[valid])
+    rank = df.groupby(['source1_entity_id', '_s2'])['score'].rank(method='first', ascending=False)
+    cap = np.where(df['_s2'].values, max_s2, max_s3)
+    return df[rank.values <= cap].sort_values('score', ascending=False).drop(columns='_s2')

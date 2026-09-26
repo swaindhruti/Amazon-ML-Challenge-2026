@@ -3,12 +3,13 @@ import xgboost as xgb
 import pandas as pd
 import numpy as np
 
-from src.features import FEATURE_COLS
-from src.embeddings import load_embedding_model
+from src.features import FEATURE_COLS, OPTIONAL_FEATURE_COLS
+from src.parallel import resolve_n_jobs
 
 
 class EntityMatchingModel:
-    def __init__(self, use_transformer=False):
+    def __init__(self, use_transformer=False, n_jobs=None):
+        self.n_jobs = resolve_n_jobs(n_jobs)
         self.model = xgb.XGBClassifier(
             # Many shallow trees (max_depth=6) rather than few deep ones, plus
             # min_child_weight/gamma/reg_alpha/reg_lambda all pulling toward
@@ -27,39 +28,40 @@ class EntityMatchingModel:
             reg_alpha=0.1,
             reg_lambda=1.0,
             random_state=42,
-            # Bias toward precision: penalize false positives more
-            scale_pos_weight=0.7,
+            # Neutral class weight: the training pairs now come from the real
+            # blocking output (see training.py), so the class ratio already
+            # matches inference. The precision bias F0.5 wants is applied
+            # where it belongs -- by tuning the decision threshold against
+            # F0.5 on held-out entities -- instead of distorting the
+            # probabilities here.
+            scale_pos_weight=1.0,
+            # All cores for tree building (XGBoost defaults to a single
+            # thread on some builds/containers).
+            n_jobs=self.n_jobs,
             tree_method='hist',  # histogram-binned splits -- needed for speed at 10M+ row scale
             eval_metric='logloss',
             early_stopping_rounds=30,
         )
+        # Only gates whether semantic_sim is used as a feature; the embedding
+        # model itself is loaded once by the pipeline (src/embeddings.py) and
+        # never needed inside the classifier.
         self.use_transformer = use_transformer
-        self.transformer_model = None
         self.is_fitted = False
-
-        if self.use_transformer:
-            # load_embedding_model() (src/embeddings.py) never raises -- it
-            # returns None on any failure (no network, model unavailable,
-            # etc.) and logs why, so this stays a graceful degrade to
-            # lexical-only scoring rather than a crash either way.
-            self.transformer_model = load_embedding_model()
 
     def prepare_X(self, df_features: pd.DataFrame) -> pd.DataFrame:
         """Select model feature columns, gracefully handling missing columns.
-        
-        When a pre-trained model is loaded, detects its expected feature set
-        and only selects those columns to avoid feature_names mismatch errors.
+
+        A fitted model dictates its own columns (its booster's feature names,
+        in its order); any the current run didn't compute (e.g. semantic_sim
+        when --use_embeddings is off but the model was trained with it) are
+        filled with NaN, which XGBoost treats as 'missing', instead of
+        raising a feature-name mismatch mid-run.
         """
-        # If model is already fitted, check its expected features
         if self.is_fitted and hasattr(self.model, 'get_booster'):
             try:
-                booster = self.model.get_booster()
-                model_features = booster.feature_names
+                model_features = self.model.get_booster().feature_names
                 if model_features:
-                    available = [c for c in model_features if c in df_features.columns]
-                    if len(available) == len(model_features):
-                        return df_features[available]
-                    # If not all model features are available, fall back
+                    return df_features.reindex(columns=list(model_features))
             except Exception:
                 pass
 
@@ -72,8 +74,12 @@ class EntityMatchingModel:
                 'name_length_ratio', 'name_token_overlap'
             ]
             available = [c for c in legacy_cols if c in df_features.columns]
-        if self.use_transformer and 'semantic_sim' in df_features.columns:
-            available.append('semantic_sim')
+        for c in OPTIONAL_FEATURE_COLS:
+            if c not in df_features.columns:
+                continue
+            if c == 'semantic_sim' and not self.use_transformer:
+                continue
+            available.append(c)
         return df_features[available]
 
     def fit(self, df_features: pd.DataFrame, y: pd.Series,
@@ -161,7 +167,7 @@ class EntityMatchingModel:
 
     def load(self, path: str) -> bool:
         if os.path.exists(path):
-            self.model = xgb.XGBClassifier()
+            self.model = xgb.XGBClassifier(n_jobs=self.n_jobs)
             self.model.load_model(path)
             self.is_fitted = True
             return True
