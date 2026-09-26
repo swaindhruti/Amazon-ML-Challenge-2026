@@ -5,7 +5,7 @@ A scalable, memory-efficient Machine Learning solution for Business Entity Resol
 
 Designed to process $> 11$ million multi-country records within **32 GB RAM** on an AWS SageMaker `ml.m5.2xlarge` instance without triggering the Linux OOM killer.
 
-**Contents:** [How It Works](#how-it-works-plain-english) · [Architecture & Data Flow](#architecture--data-flow) · [Semantic Matching](#semantic-matching-embeddings) · [Key Highlights](#key-highlights--innovations) · [Roadmap](#roadmap-hardening-against-real-dataset-findings) · [Directory Structure](#directory-structure) · [Dataset Setup](#dataset-setup) · [Quickstart](#quickstart) · [Docker](#docker) · [Output Format](#output-format)
+**Contents:** [How It Works](#how-it-works-plain-english) · [Architecture & Data Flow](#architecture--data-flow) · [Round 3: owner-assignment](#round-3-a-different-approach--let-matches-compete-for-their-targets) · [Semantic Matching](#semantic-matching-embeddings) · [Key Highlights](#key-highlights--innovations) · [Roadmap](#roadmap-hardening-against-real-dataset-findings) · [Directory Structure](#directory-structure) · [Dataset Setup](#dataset-setup) · [Quickstart](#quickstart) · [Docker](#docker) · [Output Format](#output-format)
 
 ---
 
@@ -15,12 +15,12 @@ The task: for every business in **Source 1** (a clean, deduplicated reference li
 
 The scoring metric (Macro F0.5) punishes a wrong match *twice as hard* as a missed one, and rewards correctly saying "no match" at full credit. So the whole pipeline is built around **precision first, recall second**:
 
-1. **Clean & normalize** every name/address the same way, regardless of source (`preprocessing.py`) — lowercase, strip punctuation, expand abbreviations, remove legal suffixes (`Pvt Ltd`, `LLC`, `SARL`...), and — since real data forced this — transliterate non-Latin scripts and strip accent noise before anything else runs.
-2. **Never compare across countries.** The ground truth shows 0% of matches cross a country boundary, so blocking and scoring are strictly partitioned by country — this alone rules out the vast majority of impossible pairs before any real comparison work happens.
-3. **Block, don't brute-force** (`candidate_generation.py`). Comparing every Source 1 record against every Source 2/3 record is billions of comparisons — instead, an inverted index maps cheap "keys" (name prefixes, significant words, phonetic codes, address numbers) to the records that share them, so each Source 1 entity only ever gets compared against a short list of plausible candidates.
-4. **Score each candidate pair** on 17 similarity features (`features.py`) — name similarity (several algorithms, on both the full name and the legal-suffix-stripped "core" name), structural signals (shared tokens, length ratios), and address similarity (word overlap, character overlap, matching numbers).
-5. **Decide with a threshold, then cap per source** (`model.py`, `pipeline.py`). A candidate becomes a match only above a tuned score threshold, and even then at most 5 Source 2 matches + 6 Source 3 matches survive per entity — that specific 5/6 split come from measuring the real ground-truth cardinality distribution, not a guess.
-6. **Stream results to disk** in batches, so memory use stays flat regardless of how many millions of records are being processed.
+1. **Clean & normalize** every name/address the same way, regardless of source (`preprocessing.py`) — lowercase, strip punctuation, expand abbreviations, remove legal suffixes (`Pvt Ltd`, `LLC`, `SARL`...), transliterate non-Latin scripts, and undo the specific noise found in the real data: `L.L.C.`, digit-for-letter typos (`F0nes`), website tails (`| www.x.com`), a leading `The`, `<NULL>` placeholders, and per-source address formats (S3 writes US states as `Texas` where S1/S2 write `TX`; for India it's the other way round).
+2. **Never compare across countries.** Essentially all matches stay inside one country (an earlier analysis found 0%; a recent spot check found at least one apparent exception — `scripts/gt_stats.py` measures it exactly), so blocking and scoring are strictly partitioned by country — this alone rules out the vast majority of impossible pairs before any real comparison work happens.
+3. **Block, don't brute-force** (`candidate_generation.py`). An inverted index maps cheap "keys" (name prefixes, significant words, phonetic codes, address numbers) to the records that share them. A pool of 100 candidates per Source 1 entity is pulled by key overlap, then cut to the best 30 by a cheap TF-IDF similarity — same candidate-set size, higher recall.
+4. **Score each candidate pair** with a trained XGBoost model on ~29 similarity features (`features.py`) — name similarity (several algorithms, on the full and the legal-suffix-stripped name, plus a space-free form for domain-style names), address similarity, and location agreement/conflict (same state? conflicting house numbers?). The model is trained on the *same* blocked candidate pairs it will later score (`training.py`), not on random pairs.
+5. **Let matches compete for their targets** (`decision.py`). In the real ground truth every matched Source 2/3 record belongs to *exactly one* Source 1 entity, so when two Source 1 entities both look like plausible owners of a record only one can be right. A soft "one-owner" rule pushes the runner-up down before the tuned threshold is applied; then at most 5 Source 2 + 6 Source 3 matches survive per entity (from the real ground-truth cardinalities).
+6. **Stream results to disk** per country, so memory stays bounded regardless of how many millions of records are being processed.
 
 Everything below this point is either the detailed technical view of that same pipeline (diagrams), or a running log of specific bugs we found by reading the *actual* competition data and what we did about each one (roadmap table).
 
@@ -28,7 +28,7 @@ Everything below this point is either the detailed technical view of that same p
 
 ## Architecture & Data Flow
 
-### End-to-end pipeline (green = round 1 additions, blue = round 2 [R2], see below)
+### End-to-end pipeline (green = round 1, blue = round 2 [R2], amber = round 3 [R3])
 
 ```mermaid
 flowchart TD
@@ -41,7 +41,7 @@ flowchart TD
         B3["Strip legal suffixes<br/>(Inc/Ltd/Pvt/SARL/GmbH...)"]
         B4["Extract numeric tokens<br/>(zip / building numbers)"]
         B5["Strip address landmark words<br/>(Near/Opposite/Behind...)"]
-        B6["Compact (space-free) name +<br/>native-script legal suffixes [R2]"]
+        B6["Symmetric noise fixes + state codes [R2/R3]<br/>compact name, L.L.C., F0nes, TX=Texas"]
         B1 --> B2 --> B3 --> B4 --> B5 --> B6
     end
 
@@ -59,17 +59,20 @@ flowchart TD
     D --> E["Candidate capping<br/>(top-30 by rarity-weighted key overlap) [R2]"]
     EM["Optional: multilingual embeddings<br/>native-script targets, FAISS/HNSW [R2]"] -.-> E
     E --> F[("candidate_pairs.tsv")]
-    E --> G["Feature Extraction, multi-core [R2]<br/>(24 lexical/address features + IDF cosine + semantic_sim)"]
+    E --> G["Feature Extraction, multi-core [R2/R3]<br/>(~29 lexical/address/state features + IDF cosine + semantic_sim)"]
     G --> H["Scoring: XGBoost trained on blocking-derived<br/>hard pairs (training.py) [R2]<br/>(heuristic only if no checkpoint)"]
     T[("Train split + ground truth")] -.-> TR["Train + calibrate threshold<br/>entity-level split, val/test excluded [R2]"]
     TR -.-> H
-    H --> I["Calibrated threshold + per-source cap<br/>(&lt;=5 S2, &lt;=6 S3)"]
+    H --> OW["One-owner normalization [R3]<br/>a record has exactly one owner S1<br/>(decision.py)"]
+    OW --> I["Calibrated threshold + per-source cap<br/>(&lt;=5 S2, &lt;=6 S3)"]
     I --> J[("matching_results.tsv")]
 
     classDef new fill:#d4f7dc,stroke:#2f9e44,color:#1b4332,font-weight:bold;
     class B1,B5,D3 new;
     classDef r2 fill:#dbeafe,stroke:#1d4ed8,color:#1e3a8a,font-weight:bold;
     class B6,E,EM,G,H,TR r2;
+    classDef r3 fill:#fde68a,stroke:#b45309,color:#78350f,font-weight:bold;
+    class OW r3;
 ```
 
 ### What the cross-script fix actually does, on a real row pair
@@ -159,6 +162,75 @@ Verified on synthetic data: the parallel and serial feature paths give identical
 
 ---
 
+## Round 3: a different approach — let matches compete for their targets
+
+Round 2 fixed *how the score is produced*. Round 3 changes *how scores become matches*, using structure in the real ground truth that a pair-by-pair score cannot see. The numbers in the first table below were read from `train_ground_truth.tsv` and the source files (`scripts/gt_stats.py` recomputes them on SageMaker, and also measures the cross-country rate, which is the one fact here I have *not* re-verified).
+
+| Fact (real training data) | Value | Consequence |
+|---|---|---|
+| S1 entities | 2,206,821 | |
+| Singletons (no matches) | **5.6%** | Predicting "no match" is almost always wrong: a global threshold that leaves an entity with an empty list scores 0 for ~94% of them |
+| Matches per non-singleton S1 | mean 3.67, median 4, max 11; ~85% match in **both** S2 and S3 | Recall matters as much as precision; most entities have several matches |
+| Matched target records | 7,638,365 — **all distinct**; 0 claimed by two S1 entities | **Every matched record has exactly one owner.** ~74% of the 10.3M targets are owned; ~26% are distractors |
+| Address format by source | US state: `TX` (S1/S2) vs `Texas` (S3); India: `Maharashtra` (S1/S2) vs `MH` (S3), plus native script | Every S1↔S3 pair carries a phantom state mismatch unless states are normalized |
+| Name noise (S2/S3) | dotted acronyms ~2.9%, digit-for-letter typos ~1.6% (≈0 in S1), leading `The` ~1%, `\| www.x.com` tails ~0.3%, domain-style names ~4% of targets | Each is fixed symmetrically in `preprocessing.py` |
+
+### What changed
+
+1. **One-owner decision layer** (`src/decision.py`). A soft "one owner per record" rule (a Luce choice model with a "none of them" option): when two S1 entities both look like a plausible owner of a target, the runner-up is pushed down before the threshold is applied. On the proxy below, ~40% of the highest-scoring false positives were targets owned by a *different* S1 entity whose own match was simply better. A learned second stage over per-entity context features was tried and was **worse** on held-out data (it didn't transfer between worlds of different size), so it is not used; a hard "best owner only" filter helped less than the soft rule.
+2. **Candidate re-ranking** (`candidate_generation.py`). The lexical keys reach ~99% (US) / ~96% (India) recall when uncapped, but a 30-candidate cap kept only ~95% / ~93%. Now a pool of 100 is pulled by key overlap and cut to the best 30 by `0.25·name-TF-IDF + 0.5·address-TF-IDF + 0.4·key-weight` (weights chosen on the train world only). Same candidate-set size, higher recall ceiling; on the proxy a re-ranked top-20 beat the old top-30.
+3. **Symmetric noise normalization + state codes** (`preprocessing.py`): `L.L.C.`→`llc`, `F0nes`→`fones`, `Texas`/`TX`→`tx`, `Fourth`→`4th`, `0658`→`658`, `Drive`/`Dr`→`dr`, website tails, leading `The`, `M/s`, `<NULL>`, unit/place-type filler. Two new feature families use it: `state_match` / `state_conflict` and `nums_conflict` / `first_num_conflict` (the same name in another state, or `15/383` vs `15/404`, is a *different business* — the signature of same-name distractors among high-scoring false positives).
+4. **Compound blocking keys** (`--no_compound_keys` to disable): name-word+state, name-prefix+state, name-word+street. **Unmeasured — added for scale, not for the proxy.** Any key held by more than 10,000 records is dropped from the index entirely; on the real ~6M-record US pool many common name words and city tokens exceed that, so an entity whose name keys are all common would lose its name-based candidates. A slice of the data ~50× smaller never hits that limit, so this gap could not show up in any small-scale test. Compound keys stay small. **A/B it** (below) rather than trusting it.
+5. **Training runs no longer re-score the train split** (`--infer_after_train` to opt back in): after training + validation the old flow repeated the most expensive pass to write files nobody submits.
+
+### Indicative proxy results (not leaderboard predictions)
+
+Measured on a **closed sub-world** of the real training data (`scripts/make_subworld.py`: every S1 entity whose name starts with `z,y,q,x` — 44,736 entities, ~2% — plus every target they own and the un-owned targets from the same slice; split into a train world and a disjoint test world of 15,658 entities / 54,215 true pairs, scored with `scripts/score_submission.py` against the test world's ground truth). Ownership structure, singleton rate and noise are the real ones; what's missing is cross-slice confusers and — importantly — **scale**, so absolute numbers are optimistic.
+
+| Pipeline | Macro F0.5 (proxy test world) |
+|---|---|
+| Old pipeline (untrained heuristic, threshold 0.62 — what scored **0.616** on the real test) | 0.789 |
+| Round 2: trained classifier on blocking-derived pairs | 0.952 |
+| + candidate re-ranking (pool 100 → 30) | 0.959 |
+| + noise normalization + state / number-conflict features | 0.966 |
+| + one-owner decision (Round 3) | **0.974** |
+
+The old pipeline lost **0.17** going from proxy (0.789) to real (0.616), almost entirely from scale (a ~50× larger pool means far more look-alike records and heavier blocking crowding). Expect the new pipeline to lose ground the same way; **do not read 0.974 as a prediction** — a crude "subtract the same gap" gives ~0.80, and the true figure is only known after a SageMaker run. (The classifier in these proxy runs was a scikit-learn gradient-boosting stand-in, not XGBoost.) Compound keys (#4) and everything about France (unseen in training) are **not** reflected in these numbers.
+
+### What to run on SageMaker, and what to read
+
+```bash
+export PYTHONPATH=aads_submission/business_entity_resolution/code
+# 0a. Re-verify the ground-truth facts this design assumes (needs a few GB RAM)
+python3 aads_submission/business_entity_resolution/code/scripts/gt_stats.py --data_dir student_resource/dataset
+# 0b. Optional fast loop (minutes): a ~9% closed slice with a scorable test world
+python3 aads_submission/business_entity_resolution/code/scripts/make_subworld.py \
+    --data_dir student_resource/dataset --out_dir subworld --letters zyqxuvw
+python3 -m src.pipeline --data_dir subworld --is_train --validate --model_path models/sub.json
+python3 -m src.pipeline --data_dir subworld --model_path models/sub.json \
+    --matching_out output/sub_match.tsv --candidate_out output/sub_cand.tsv
+python3 aads_submission/business_entity_resolution/code/scripts/score_submission.py \
+    --pred output/sub_match.tsv --truth subworld/test/test_ground_truth.tsv
+
+# 1. Real run: train + validate on the full train split (the long one), then infer on test
+python3 -m src.pipeline --data_dir student_resource/dataset --is_train --validate
+python3 -m src.pipeline --data_dir student_resource/dataset
+```
+
+Things worth reading in the `--validate` output:
+- **`recall_ceiling`** (blocking): the hard cap on recall. If it's well below ~0.95, raise `--pool_k` (e.g. 200) and/or `--top_k` (e.g. 40) — candidate-set size is graded separately, so change one thing at a time.
+- **`[raw pair probability]` vs `[one-owner normalized]`** lines: the same scores under both decision rules; the pipeline keeps whichever wins on the **val** fold and reports the **test** fold for it. If `owner` doesn't win at full scale, that's real information — `--no_owner` disables it.
+- **Per-country breakdown**: a large India/US gap points at native-script handling (try `--use_embeddings`).
+- **A/B for the compound keys**: run the sub-world loop twice, with and without `--no_compound_keys`, and compare `recall_ceiling` and the test-world score. The sub-world is too small to reveal the block-size effect they target, so a **full** validation run (with vs without) is the real test.
+- **France** has no training data. Its records get no state features (treated like any record with a missing state), so its per-country numbers can't be validated locally — watch its predicted-singleton rate in the inference summary: it should be near the ~5.6% seen elsewhere.
+
+### Known gaps (not addressed)
+- About a quarter of the remaining blocking misses on the proxy were **domain-style target names** (`yoginienggcom`, `TECHZIB.COM`): ~4% of targets, ~5.5% of true pairs, only ~85% blocking recall on them. A compact-name blocking key would help but wasn't added because it can't be evaluated without a run.
+- Validation scores **every** S1 entity (so target competition is complete), which costs a second full pass; the train-time index is rebuilt per phase. Expect the `--is_train --validate` run to be long; the sub-world loop above is the fast way to iterate.
+- `optimize_submission.py` is the pre-Round-2 standalone script (old 17-feature set); the pipeline no longer uses it.
+
+---
+
 ## Semantic Matching (Embeddings) — optional
 
 A supplement, **not** the main scoring engine (the trained classifier carries the score). Cross-script matching is already attacked lexically by transliteration + Soundex; an embedding model can catch what those miss.
@@ -238,6 +310,12 @@ AmazonMLC/
 │       └── code/
 │           ├── README.md                              # Code guide
 │           ├── requirements.txt                       # Python dependencies (torch: install the CPU wheel, see file)
+│           ├── scripts/
+│           │   ├── make_subworld.py               # Closed sub-world of the real data (fast, scorable loop)
+│           │   ├── score_submission.py            # Macro F0.5 of any matching file vs a ground-truth TSV
+│           │   └── gt_stats.py                    # Re-verifies the ground-truth facts the design relies on
+│           ├── tests/
+│           │   └── test_decision.py               # Plain-assert tests for the decision layer
 │           └── src/
 │               ├── candidate_generation.py            # Memory-compact inverted index & batching
 │               ├── blocking.py                        # Backward-compatibility alias
@@ -250,6 +328,7 @@ AmazonMLC/
 │               ├── embeddings.py                      # Optional multilingual-embedding candidates + semantic_sim
 │               ├── parallel.py                        # Process pool + native thread config (multi-core)
 │               ├── country_pipeline.py                # Shared per-country blocking/TF-IDF/embedding/feature builder
+│               ├── decision.py                        # One-owner normalization + per-source caps (Round 3)
 │               ├── training.py                        # Hard-pair training, entity-level split, threshold calibration
 │               └── pipeline.py                        # Orchestration: train/load, validate, inference
 └── student_resource/                                  # Fetched separately -- see Dataset Setup
@@ -290,7 +369,7 @@ python3 -m src.pipeline \
     --data_dir student_resource/dataset \
     --is_train --validate
 ```
-Trains XGBoost on blocking-derived hard pairs (`--train_sample`, default 80k S1 entities), saves `models/entity_model.json` + `models/entity_model_calibration.json`, then scores the held-out val/test folds and prints the **test-fold Macro F0.5**, the recall ceiling, and a per-country breakdown. Uses every CPU by default (`--n_jobs N` to cap).
+Trains XGBoost on blocking-derived hard pairs (`--train_sample`, default 80k S1 entities), saves `models/entity_model.json` + `models/entity_model_calibration.json`, then scores **all** S1 entities (so target competition is complete) and prints the **test-fold Macro F0.5** for both decision rules, the recall ceiling, and a per-country breakdown. It stops there — it does not re-score the train split to write outputs (`--infer_after_train` if you want that). Uses every CPU by default (`--n_jobs N` to cap). This is the long run; see [Round 3](#round-3-a-different-approach--let-matches-compete-for-their-targets) for a fast sub-world loop.
 
 ### 3. Run inference on the test split
 ```bash

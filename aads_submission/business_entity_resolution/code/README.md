@@ -13,6 +13,9 @@ The pipeline resolves entities from a deduplicated reference source (Source 1) a
 - **International legal suffix removal** — LLC, Inc, Ltd, SA, SAS, SARL, GmbH, etc.
 - **Training on blocking-derived hard pairs** (same code path as inference), entity-level train/val split, early stopping
 - **Multi-core** feature building (`--n_jobs`, default all CPUs)
+- **One-owner decision layer** (`src/decision.py`): each matched S2/S3 record belongs to exactly one S1 entity (verified on the real ground truth), so competing candidates are pushed down before the threshold
+- **Candidate re-ranking**: pool of 100 by key overlap → best 30 by TF-IDF similarity (`--pool_k`, `--top_k`)
+- **Symmetric noise normalization + canonical state codes** in `preprocessing.py`
 
 ### 32 GB RAM Architecture Optimizations
 1. **S1 Batch Chunking**: Slices Source 1 into batches (default: `batch_size = 50,000`). Blocking, feature extraction, scoring, and output writing are executed per batch, followed by immediate `gc.collect()`.
