@@ -1,5 +1,0 @@
-# Optional: only needed for EntityMatchingModel(use_transformer=True), which
-# is off by default everywhere in this codebase. Adds ~2GB+ to the
-# environment/Docker image, so it's kept out of requirements.txt.
-sentence-transformers==3.0.1
-torch==2.3.1

@@ -1,5 +1,4 @@
-# Core pipeline dependencies -- this is everything the default code path
-# (use_transformer=False everywhere it's constructed) actually needs.
+# Core pipeline dependencies.
 pandas==2.2.2
 numpy==1.26.4
 scikit-learn==1.4.2
@@ -9,8 +8,16 @@ rapidfuzz==3.8.1
 text-unidecode==1.3
 tqdm==4.66.4
 
-# sentence-transformers + torch (~2GB+ combined) are intentionally NOT
-# installed by default: EntityMatchingModel(use_transformer=True) is the only
-# code path that needs them, it's off by default, and model.py already
-# guards the import in a try/except so its absence never breaks the default
-# pipeline. Install requirements-optional.txt only if you're turning that on.
+# Cross-script semantic matching (see src/embeddings.py). Graphlet-AI/eridu
+# is a ~118M-param sentence-transformers model, well under the 8B-parameter
+# limit. CPU-only torch build strongly recommended on SageMaker unless a GPU
+# instance is actually provisioned -- see requirements-optional.txt for the
+# CPU-wheel install command; a plain `pip install torch` here pulls the much
+# larger CUDA-enabled build even on a CPU-only instance.
+sentence-transformers==3.0.1
+torch==2.3.1
+
+# Candidate retrieval over embeddings at real dataset scale (millions of
+# rows) needs an actual nearest-neighbor index, not a brute-force similarity
+# matrix -- faiss-cpu (MIT licensed) is the standard tool for this.
+faiss-cpu==1.8.0
