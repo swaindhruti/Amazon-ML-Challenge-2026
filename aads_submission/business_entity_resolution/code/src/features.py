@@ -97,11 +97,26 @@ def build_batch_features(
     df_query: pd.DataFrame,
     df_target: pd.DataFrame,
     query_indices: np.ndarray,
-    target_indices: np.ndarray
+    target_indices: np.ndarray,
+    query_embeddings: np.ndarray = None,
+    target_embeddings: np.ndarray = None,
 ) -> pd.DataFrame:
     """
     Computes pairwise similarity features between df_query and df_target using integer index arrays.
     Enhanced with 16 features for high-precision entity resolution.
+
+    query_embeddings/target_embeddings (optional): L2-normalized sentence
+    embeddings (see src/embeddings.py), aligned 1:1 with df_query/df_target
+    rows (NOT with query_indices/target_indices -- those still index into
+    the full arrays the same way they index into df_query/df_target). When
+    both are provided, adds a semantic_sim column (cosine similarity, i.e.
+    a plain dot product on normalized vectors) -- the one feature here that
+    can catch a true match across scripts/languages the other 17 lexical
+    features structurally cannot, since they all operate on literal
+    characters. Omitted (not just zero-filled) when not provided, so
+    model.py's EntityMatchingModel only uses it when it actually has a
+    real value to offer, and prepare_X gates it on use_transformer
+    separately.
     """
     if len(query_indices) == 0:
         return pd.DataFrame()
@@ -186,7 +201,7 @@ def build_batch_features(
     nums_exact = [1.0 if (z1 and z1 == z2) else 0.0 for z1, z2 in zip(q_nums, t_nums)]
     nums_overlap = [_nums_overlap_score(z1, z2) for z1, z2 in zip(q_nums, t_nums)]
 
-    return pd.DataFrame({
+    result = {
         'source1_entity_id': q_ids,
         'candidate_entity_id': t_ids,
         # -- Name (normalized) features --
@@ -210,7 +225,14 @@ def build_batch_features(
         'addr_ngram_sim': np.array(addr_ngrams, dtype=np.float32),
         'zip_exact': np.array(nums_exact, dtype=np.float32),
         'nums_overlap': np.array(nums_overlap, dtype=np.float32),
-    })
+    }
+
+    if query_embeddings is not None and target_embeddings is not None:
+        q_emb = query_embeddings[query_indices]
+        t_emb = target_embeddings[target_indices]
+        result['semantic_sim'] = np.sum(q_emb * t_emb, axis=1).astype(np.float32)
+
+    return pd.DataFrame(result)
 
 
 # Feature column list used by model — single source of truth
